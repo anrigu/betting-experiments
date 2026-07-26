@@ -227,10 +227,12 @@ function render() {
     (lastCycle ? " · last cycle " + fmtTs(lastCycle.finished_at || lastCycle.started_at) : "");
 
   const a = d.account;
+  const acctLabel = d.mode === "live" ? "Kalshi account" : "Simulated equity (dry-run)";
+  const snapLabel = d.mode === "live" ? "venue snapshot" : "snapshot";
   $("account-line").innerHTML = a.equity_usd == null
     ? "No account snapshot yet" + (d.warning ? " · <span class='down'>" + d.warning + "</span>" : "")
-    : `Kalshi account: <b>${fmt$(a.equity_usd)}</b> = cash ${fmt$(a.balance_usd)} + open positions ${fmt$(a.portfolio_value_usd)}
-       · ${fmtN(a.open_positions)} open · venue snapshot ${fmtTs(a.snapshot_at)}`;
+    : `${acctLabel}: <b>${fmt$(a.equity_usd)}</b> = cash ${fmt$(a.balance_usd)} + open positions ${fmt$(a.portfolio_value_usd)}
+       · ${fmtN(a.open_positions)} open · ${snapLabel} ${fmtTs(a.snapshot_at)}`;
 
   // KPI tiles
   const lanes = d.lanes || [];

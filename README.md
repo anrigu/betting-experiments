@@ -76,7 +76,17 @@ pytest engine/tests/                             # strategy math
 
 ## Data
 
-Everything lands in Supabase schema `betting_experiments`: `predictions`, `decisions` (every
-bet AND skip is an audit row), `orders`, `fills`, `settlements`, `equity_snapshots`,
-`position_snapshots`, `markets`, `llm_calls`, `engine_cycles`. Venue truth (fills, fees,
-settlement revenue) always overwrites estimates.
+Everything lands in Supabase schema `profit_trading_exp` (configurable via `BETX_DB_SCHEMA`):
+
+- `predictions` — every arena forecast ingested (bet lanes + fixed-context references), with
+  rationale and per-instance dedupe on the arena prediction id
+- `book_snapshots` — the **full order book** (raw venue bid ladders + derived executable ask
+  ladders) and complete market payload (status, close, OI, volume, liquidity, quotes) captured
+  at decision time, one per (cycle, ticker)
+- `decisions` — every bet AND skip is an audit row, linked to its prediction and book snapshot
+- `orders`, `fills`, `settlements` — execution trail; venue truth (fills, fees, settlement
+  revenue) always overwrites estimates
+- `equity_snapshots`, `position_snapshots`, `markets`, `engine_cycles`, `llm_calls`
+
+A crash between prediction-ingest and decide loses nothing: candidates are re-derived each
+cycle from predictions that still lack a decision row for one of their lanes.

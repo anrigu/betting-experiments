@@ -208,6 +208,7 @@ def build_payload() -> dict:
         {
             "as_of": now.isoformat(),
             "instance": inst,
+            "schema": cfg.db_schema,
             "mode": "dry_run" if cfg.dry_run else "live",
             "bet_predictors": cfg.bet_predictors,
             "reference_predictors": cfg.reference_predictors,
@@ -261,11 +262,13 @@ def _lane_holdings(inst: str, lane: str) -> list[dict]:
     for r in rows:
         pos = int(r["yes_n"]) - int(r["no_n"])
         netted = min(int(r["yes_n"]), int(r["no_n"]))
+        lp = r["last_price"]
         if pos > 0:
-            mark = (r["yes_bid"] or r["last_price"] or 0) / 100.0
+            mark = (r["yes_bid"] if r["yes_bid"] is not None else lp if lp is not None else 0) / 100.0
             value = pos * mark
         elif pos < 0:
-            mark = (r["no_bid"] or (100 - (r["last_price"] or 0)) or 0) / 100.0
+            no_mark = r["no_bid"] if r["no_bid"] is not None else (100 - lp if lp is not None else 0)
+            mark = no_mark / 100.0
             value = -pos * mark
         else:
             mark, value = None, 0.0

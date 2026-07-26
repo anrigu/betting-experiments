@@ -147,7 +147,7 @@ class ArenaDB:
                  p.predictor_name, p.event_ticker, p.prediction
           FROM prediction p
           WHERE p.predictor_name = ANY(%s)
-            AND p.created_at > now() - make_interval(days => %s)
+            AND p.created_at > now() - (interval '1 day' * %s)
           ORDER BY p.predictor_name, p.event_ticker, p.created_at DESC
         )
         SELECT l.predictor_name, l.prediction, e.market_outcome

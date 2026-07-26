@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS {s}.predictions (
     latency_ms INT,
     external_id TEXT,                   -- arena prediction id for dedupe
     raw JSONB,
-    UNIQUE (source, external_id)
+    UNIQUE (instance, source, external_id)
 );
 
 CREATE TABLE IF NOT EXISTS {s}.llm_calls (
@@ -194,6 +194,26 @@ CREATE TABLE IF NOT EXISTS {s}.settlements (
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_decisions_dedupe
     ON {s}.decisions (instance, strategy, prediction_id, ticker);
+CREATE TABLE IF NOT EXISTS {s}.book_snapshots (
+    id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    instance TEXT NOT NULL,
+    cycle_id BIGINT,
+    ticker TEXT NOT NULL,
+    status TEXT,
+    close_time TIMESTAMPTZ,
+    yes_bid INT, yes_ask INT, no_bid INT, no_ask INT, last_price INT,
+    volume_24h DOUBLE PRECISION,
+    open_interest DOUBLE PRECISION,
+    liquidity DOUBLE PRECISION,
+    orderbook JSONB,                 -- raw venue book (bid ladders per side)
+    yes_asks JSONB, no_asks JSONB,   -- derived executable ask ladders decisions priced from
+    raw_market JSONB                 -- full market payload at decision time
+);
+
+ALTER TABLE {s}.decisions ADD COLUMN IF NOT EXISTS book_snapshot_id BIGINT;
+
+CREATE INDEX IF NOT EXISTS idx_book_snapshots_ticker ON {s}.book_snapshots (ticker, created_at);
 CREATE INDEX IF NOT EXISTS idx_predictions_ticker ON {s}.predictions (ticker, created_at);
 CREATE INDEX IF NOT EXISTS idx_decisions_strategy ON {s}.decisions (strategy, created_at);
 CREATE INDEX IF NOT EXISTS idx_orders_strategy ON {s}.orders (strategy, created_at);
@@ -263,26 +283,59 @@ class Store:
         except psycopg.errors.UniqueViolation:
             return None  # already ingested (arena dedupe)
 
-    def insert_predictions_bulk(self, rows: list[dict[str, Any]]) -> dict[str, int]:
-        """Insert many prediction rows in one round trip; returns
-        {external_id: id} for the rows that were actually new."""
+    def insert_predictions_bulk(self, rows: list[dict[str, Any]], chunk: int = 500) -> dict[str, int]:
+        """Insert many prediction rows (chunked to stay under the wire param
+        limit); returns {external_id: id} for the rows that were actually new."""
         if not rows:
             return {}
         cols = list(rows[0].keys())
-        values_sql = ", ".join(
-            "(" + ", ".join(["%s"] * len(cols)) + ")" for _ in rows
-        )
-        params: list[Any] = []
-        for r in rows:
-            params.extend(json.dumps(v) if isinstance(v, (dict, list)) else v for v in (r[c] for c in cols))
-        sql = (
-            f"INSERT INTO {self.schema}.predictions ({', '.join(cols)}) VALUES {values_sql} "
-            f"ON CONFLICT (source, external_id) DO NOTHING RETURNING external_id, id"
-        )
+        out: dict[str, int] = {}
         with self.conn() as c:
-            out = {r["external_id"]: r["id"] for r in c.execute(sql, params).fetchall()}
+            for i in range(0, len(rows), chunk):
+                batch = rows[i:i + chunk]
+                values_sql = ", ".join(
+                    "(" + ", ".join(["%s"] * len(cols)) + ")" for _ in batch
+                )
+                params: list[Any] = []
+                for r in batch:
+                    params.extend(json.dumps(v) if isinstance(v, (dict, list)) else v for v in (r[c2] for c2 in cols))
+                sql = (
+                    f"INSERT INTO {self.schema}.predictions ({', '.join(cols)}) VALUES {values_sql} "
+                    f"ON CONFLICT (instance, source, external_id) DO NOTHING RETURNING external_id, id"
+                )
+                out.update({r["external_id"]: r["id"] for r in c.execute(sql, params).fetchall()})
             c.commit()
-            return out
+        return out
+
+    def insert_book_snapshot(self, **row: Any) -> int | None:
+        return self._insert("book_snapshots", row)
+
+    def unprocessed_predictions(self, instance: str, predictors: list[str], lookback_hours: float) -> list[dict]:
+        """Recent bet-predictor predictions with their already-decided lanes —
+        the engine re-derives candidates from this instead of trusting the
+        in-memory insert map, so a crash between prediction-ingest and
+        decision never silently drops a forecast."""
+        preds = self.query(
+            "SELECT p.id, p.model_spec, p.ticker, p.event_ticker, p.title, p.category, "
+            "p.close_time, p.p_model, p.reasoning, p.raw->>'predicted_at' AS predicted_at, "
+            "p.raw->>'market_title' AS market_title, p.external_id "
+            "FROM {s}.predictions p WHERE p.instance = %s AND p.source = 'arena' "
+            "AND p.model_spec = ANY(%s) AND p.created_at > now() - (interval '1 hour' * %s)",
+            (instance, predictors, lookback_hours),
+        )
+        if not preds:
+            return []
+        ids = [p["id"] for p in preds]
+        decided = self.query(
+            "SELECT prediction_id, strategy FROM {s}.decisions WHERE instance = %s AND prediction_id = ANY(%s)",
+            (instance, ids),
+        )
+        by_pred: dict[int, set[str]] = {}
+        for d in decided:
+            by_pred.setdefault(d["prediction_id"], set()).add(d["strategy"])
+        for p in preds:
+            p["decided_lanes"] = by_pred.get(p["id"], set())
+        return preds
 
     def insert_llm_call(self, **row: Any) -> int | None:
         return self._insert("llm_calls", row)

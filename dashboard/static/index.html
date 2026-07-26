@@ -192,7 +192,7 @@
   <p class="foot">
     Predictions looped from ProphetArena (<span id="foot-pred">—</span>) · gates: fee-aware within-spread + no bets within <span id="foot-buffer">24</span>h of close ·
     all categories · sizing floor(edge×100) contracts · limit buys at ask, 5-min expiration · fees ⌈0.07·C·P·(1−P)⌉ ·
-    data: Supabase <code>betting_experiments</code> · refreshes every 60s.
+    data: Supabase <code id="foot-schema">profit_trading_exp</code> (predictions, decisions incl. every skip, orders, fills, settlements, full order books per decision, equity &amp; position snapshots) · refreshes every 60s.
   </p>
   <div id="tooltip"></div>
 
@@ -236,6 +236,7 @@ function render() {
   $("predictor-chip").textContent = preds.join("  vs  ") || "—";
   $("foot-pred").textContent = preds.join(", ");
   $("foot-buffer").textContent = d.close_buffer_hours;
+  if (d.schema) $("foot-schema").textContent = d.schema;
   $("engine-dot").style.background = d.engine_healthy ? "var(--good)" : "var(--critical)";
   const lastCycle = d.cycles && d.cycles[0];
   $("engine-text").textContent = "engine " + (d.engine_healthy ? "healthy" : "stale") +

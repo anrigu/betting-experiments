@@ -37,6 +37,8 @@ envVarGroups:
         value: "600"
       - key: BETX_CLOSE_BUFFER_HOURS
         value: "24"
+      - key: BETX_DB_SCHEMA
+        value: profit_trading_exp
       - key: BETX_LANES
         value: gemini:agent-gemini-3.1-pro:fundamental:150,fable-5:agent-claude-fable-5:fundamental:150
       - key: BETX_ARENA_REFERENCE_PREDICTORS

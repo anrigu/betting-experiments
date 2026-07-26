@@ -154,8 +154,8 @@ def _attribute_settlements(store: Store, cfg: Config) -> None:
               AND st.settled_ts > o.created_at
             ORDER BY st.settled_ts ASC LIMIT 1
         ) s ON TRUE
-        WHERE o.instance = %s AND o.settled_at IS NULL
-          AND o.status IN ('executed','resting','canceled','dry_run')
+        WHERE o.instance = %s AND o.settled_at IS NULL AND o.dry_run = FALSE
+          AND o.status IN ('executed','resting','canceled')
           AND COALESCE(o.filled_count, 0) > 0
         """,
         (cfg.instance_name,),

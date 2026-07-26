@@ -24,15 +24,33 @@ from typing import Any
 
 import psycopg
 
+from dataclasses import dataclass, field
+
 from . import kalshi as kalshi_mod
 from . import strategies, sync
-from .arena import ArenaDB, ArenaMarketPrediction
+from .arena import ArenaDB
 from .config import Config, Lane
 from .db import Store
 from .fees import taker_fee
 from .kalshi import KalshiClient, KalshiError
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class Candidate:
+    """A (prediction row, Kalshi market) pair awaiting lane decisions —
+    re-derived from the DB each cycle so nothing is lost across crashes."""
+    prediction_row_id: int
+    predictor_name: str
+    ticker: str
+    event_ticker: str | None
+    title: str
+    category: str | None
+    close_time: dt.datetime | None
+    p_model: float
+    predicted_at: dt.datetime
+    decided_lanes: set[str] = field(default_factory=set)
 
 
 class LaneBook:
@@ -68,6 +86,7 @@ class Engine:
         self.arena = arena
         self._market_cache: dict[str, dict[str, Any]] = {}
         self._ob_cache: dict[str, dict] = {}
+        self._book_snap_ids: dict[str, int | None] = {}
         self._books: dict[str, LaneBook] = {}
 
     # ------------------------------------------------------------------ cycle
@@ -75,6 +94,7 @@ class Engine:
         cfg = self.cfg
         self._market_cache = {}
         self._ob_cache = {}
+        self._book_snap_ids = {}
         mode = "dry_run" if cfg.dry_run else "live"
         cycle_id = self.store.start_cycle(cfg.instance_name, mode)
         stats = {"markets_considered": 0, "predictions_made": 0, "bets_placed": 0}
@@ -82,19 +102,19 @@ class Engine:
             self._books = {lane.name: LaneBook(self.store, cfg, lane) for lane in cfg.lanes}
             candidates = self._ingest(cycle_id, stats)
             random.shuffle(candidates)
-            for cand, pred_row_id in candidates:
+            for cand in candidates:
                 stats["markets_considered"] += 1
                 try:
-                    placed = self._process_candidate(cand, pred_row_id, cycle_id)
+                    placed = self._process_candidate(cand, cycle_id)
                     stats["bets_placed"] += placed
                 except Exception:
                     log.exception("candidate %s failed", cand.ticker)
             if cfg.live_enabled and not cfg.dry_run:
                 sync.sync_all(self.store, self.kalshi, cfg)
-            elif cfg.dry_run:
-                settled = sync.settle_dry_run(self.store, self.kalshi, cfg)
-                if settled:
-                    log.info("settled %d dry-run orders from real market outcomes", settled)
+            settled = sync.settle_dry_run(self.store, self.kalshi, cfg)
+            if settled:
+                log.info("settled %d dry-run orders from real market outcomes", settled)
+            if cfg.dry_run:
                 sync.snapshot_sim_equity(self.store, cfg)
             self.store.finish_cycle(cycle_id, **stats)
         except Exception as e:
@@ -103,7 +123,7 @@ class Engine:
         return stats
 
     # ----------------------------------------------------------------- ingest
-    def _ingest(self, cycle_id: int, stats: dict) -> list[tuple[ArenaMarketPrediction, int]]:
+    def _ingest(self, cycle_id: int, stats: dict) -> list[Candidate]:
         cfg = self.cfg
         watermark = self.store.prediction_watermark(cfg.instance_name, "arena")
         if watermark is None:
@@ -142,40 +162,62 @@ class Engine:
         inserted = self.store.insert_predictions_bulk(rows)
         stats["predictions_made"] += len(inserted)
 
-        bet_predictors = set(cfg.bet_predictors)
-        bet_items: list[tuple[ArenaMarketPrediction, int]] = []
-        for p in preds:
-            row_id = inserted.get(f"{p.arena_prediction_id}:{p.ticker}")
-            if row_id is not None and p.predictor_name in bet_predictors:
-                bet_items.append((p, row_id))
+        # Candidates come from the DB, not the insert map: any recent bet-
+        # predictor prediction still missing a decision for one of its lanes
+        # (survives crashes between ingest and decide, and code redeploys).
+        lookback = cfg.backfill_hours + 24
+        unprocessed = self.store.unprocessed_predictions(cfg.instance_name, cfg.bet_predictors, lookback)
+        epoch = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+        cands = []
+        for p in unprocessed:
+            missing = [l for l in cfg.lanes_for(p["model_spec"]) if l.name not in p["decided_lanes"]]
+            if not missing:
+                continue
+            cands.append(
+                Candidate(
+                    prediction_row_id=p["id"],
+                    predictor_name=p["model_spec"],
+                    ticker=p["ticker"],
+                    event_ticker=p["event_ticker"],
+                    title=p["title"] or p["ticker"],
+                    category=p["category"],
+                    close_time=p["close_time"],
+                    p_model=float(p["p_model"]),
+                    predicted_at=_parse_ts(p["predicted_at"]) or epoch,
+                    decided_lanes=set(p["decided_lanes"]),
+                )
+            )
 
         # only each predictor's newest forecast per ticker trades; older ones
         # are audited as superseded
-        newest: dict[tuple[str, str], tuple[ArenaMarketPrediction, int]] = {}
-        superseded: list[tuple[ArenaMarketPrediction, int]] = []
-        for cand, rid in bet_items:
+        newest: dict[tuple[str, str], Candidate] = {}
+        superseded: list[Candidate] = []
+        for cand in cands:
             key = (cand.predictor_name, cand.ticker)
             cur = newest.get(key)
-            if cur is None or cand.predicted_at > cur[0].predicted_at:
+            if cur is None or cand.predicted_at > cur.predicted_at:
                 if cur is not None:
                     superseded.append(cur)
-                newest[key] = (cand, rid)
+                newest[key] = cand
             else:
-                superseded.append((cand, rid))
-        for cand, rid in superseded:
+                superseded.append(cand)
+        for cand in superseded:
             for lane in cfg.lanes_for(cand.predictor_name):
-                self._save_skip(cycle_id, rid, lane.name, cand, "superseded")
+                if lane.name not in cand.decided_lanes:
+                    self._save_skip(cycle_id, cand, lane.name, "superseded")
         return list(newest.values())
 
     # ------------------------------------------------------------- candidates
-    def _process_candidate(self, cand: ArenaMarketPrediction, pred_row_id: int, cycle_id: int) -> int:
+    def _process_candidate(self, cand: Candidate, cycle_id: int) -> int:
         cfg = self.cfg
         now = dt.datetime.now(dt.timezone.utc)
-        lanes = cfg.lanes_for(cand.predictor_name)
+        lanes = [l for l in cfg.lanes_for(cand.predictor_name) if l.name not in cand.decided_lanes]
+        if not lanes:
+            return 0
         market = self._get_market(cand.ticker)
         if market is None:
             for lane in lanes:
-                self._save_skip(cycle_id, pred_row_id, lane.name, cand, "market_not_found")
+                self._save_skip(cycle_id, cand, lane.name, "market_not_found")
             return 0
 
         close_time = _parse_ts(market.get("close_time")) or cand.close_time
@@ -193,7 +235,7 @@ class Engine:
             reason = None
         if reason:
             for lane in lanes:
-                self._save_skip(cycle_id, pred_row_id, lane.name, cand, reason)
+                self._save_skip(cycle_id, cand, lane.name, reason)
             return 0
 
         try:
@@ -201,9 +243,10 @@ class Engine:
         except KalshiError as e:
             log.warning("orderbook %s failed: %s", cand.ticker, e)
             for lane in lanes:
-                self._save_skip(cycle_id, pred_row_id, lane.name, cand, "book_fetch_failed")
+                self._save_skip(cycle_id, cand, lane.name, "book_fetch_failed")
             return 0
         yes_asks, no_asks = strategies.ladders_from_orderbook(ob)
+        snap_id = self._snapshot_book(cycle_id, cand.ticker, market, ob, yes_asks, no_asks, close_time)
 
         placed = 0
         for lane in lanes:
@@ -213,21 +256,21 @@ class Engine:
                 cand.p_model, yes_asks, no_asks, book.free_cash, position
             )
             placed += self._record_and_execute(
-                cycle_id, pred_row_id, lane.name, cand, result, book, position, yes_asks, no_asks
+                cycle_id, lane.name, cand, result, book, position, yes_asks, no_asks, snap_id
             )
         return placed
 
     def _record_and_execute(
         self,
         cycle_id: int,
-        pred_row_id: int,
         lane: str,
-        cand: ArenaMarketPrediction,
+        cand: Candidate,
         result: strategies.Order | strategies.Skip,
         book: LaneBook,
         position: int,
         yes_asks: strategies.Ladder,
         no_asks: strategies.Ladder,
+        book_snapshot_id: int | None,
     ) -> int:
         cfg = self.cfg
         by = strategies.best_ask(yes_asks)
@@ -236,12 +279,13 @@ class Engine:
         common = dict(
             instance=cfg.instance_name,
             cycle_id=cycle_id,
-            prediction_id=pred_row_id,
+            prediction_id=cand.prediction_row_id,
             strategy=lane,
             ticker=cand.ticker,
             p_model=cand.p_model,
             p_market=by,
             spread=spread,
+            book_snapshot_id=book_snapshot_id,
         )
         if isinstance(result, strategies.Skip):
             try:
@@ -271,7 +315,7 @@ class Engine:
                 **common,
             )
         except psycopg.errors.UniqueViolation:
-            log.warning("decision already claimed for %s/%s/%s — skipping submit", lane, pred_row_id, cand.ticker)
+            log.warning("decision already claimed for %s/%s/%s — skipping submit", lane, cand.prediction_row_id, cand.ticker)
             return 0
 
         if not cfg.live_enabled:
@@ -281,7 +325,7 @@ class Engine:
             book.apply_order(cand.ticker, o.side, o.contracts, o.limit_price, o.fee_usd)
         return placed
 
-    def _submit(self, decision_id: int, lane: str, cand: ArenaMarketPrediction, o: strategies.Order) -> int:
+    def _submit(self, decision_id: int, lane: str, cand: Candidate, o: strategies.Order) -> int:
         cfg = self.cfg
         price_cents = max(1, min(99, int(round(o.limit_price * 100))))
         client_order_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"betx/{cfg.instance_name}/{lane}/{decision_id}"))
@@ -291,7 +335,7 @@ class Engine:
             strategy=lane,
             ticker=cand.ticker,
             event_ticker=cand.event_ticker,
-            title=f"{cand.event_title} — {cand.market_title}",
+            title=cand.title,
             category=cand.category,
             side=o.side,
             action="buy",
@@ -334,15 +378,54 @@ class Engine:
             return 0
 
     # ---------------------------------------------------------------- helpers
-    def _save_skip(self, cycle_id: int, pred_row_id: int, lane: str, cand: ArenaMarketPrediction, reason: str) -> None:
+    def _save_skip(self, cycle_id: int, cand: Candidate, lane: str, reason: str) -> None:
         try:
             self.store.insert_decision(
-                instance=self.cfg.instance_name, cycle_id=cycle_id, prediction_id=pred_row_id,
+                instance=self.cfg.instance_name, cycle_id=cycle_id, prediction_id=cand.prediction_row_id,
                 strategy=lane, ticker=cand.ticker, action="skip", skip_reason=reason,
                 p_model=cand.p_model,
             )
         except psycopg.errors.UniqueViolation:
             pass
+
+    def _snapshot_book(
+        self,
+        cycle_id: int,
+        ticker: str,
+        market: dict,
+        ob: dict,
+        yes_asks: strategies.Ladder,
+        no_asks: strategies.Ladder,
+        close_time,
+    ) -> int | None:
+        """Persist the exact market state + full book every decision priced
+        from — one snapshot per (cycle, ticker), shared across lanes."""
+        if ticker in self._book_snap_ids:
+            return self._book_snap_ids[ticker]
+        q = kalshi_mod.market_quotes(market)
+        try:
+            snap_id = self.store.insert_book_snapshot(
+                instance=self.cfg.instance_name,
+                cycle_id=cycle_id,
+                ticker=ticker,
+                status=market.get("status"),
+                close_time=close_time,
+                yes_bid=q["yes_bid"], yes_ask=q["yes_ask"],
+                no_bid=q["no_bid"], no_ask=q["no_ask"],
+                last_price=q["last_price"],
+                volume_24h=kalshi_mod.count_of(market, "volume_24h") or None,
+                open_interest=kalshi_mod.count_of(market, "open_interest") or None,
+                liquidity=q["liquidity"],
+                orderbook=ob,
+                yes_asks=[[p, c] for p, c in yes_asks],
+                no_asks=[[p, c] for p, c in no_asks],
+                raw_market=market,
+            )
+        except Exception:
+            log.exception("book snapshot failed for %s", ticker)
+            snap_id = None
+        self._book_snap_ids[ticker] = snap_id
+        return snap_id
 
     def _get_market(self, ticker: str) -> dict | None:
         if ticker in self._market_cache:
@@ -362,13 +445,13 @@ class Engine:
             self._ob_cache[ticker] = self.kalshi.orderbook(ticker)
         return self._ob_cache[ticker]
 
-    def _upsert_market(self, cand: ArenaMarketPrediction, market: dict, close_time) -> None:
+    def _upsert_market(self, cand: Candidate, market: dict, close_time) -> None:
         q = kalshi_mod.market_quotes(market)
         self.store.upsert_market(
             {
                 "ticker": cand.ticker,
                 "event_ticker": cand.event_ticker,
-                "title": market.get("title") or cand.market_title,
+                "title": market.get("title") or cand.title,
                 "category": cand.category,
                 "close_time": close_time,
                 "status": market.get("status"),

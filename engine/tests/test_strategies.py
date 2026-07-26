@@ -127,6 +127,23 @@ def test_ladders_from_orderbook_fp_dollars():
     assert best_ask(no_asks) == 0.998
 
 
+def test_lane_config_parsing(monkeypatch):
+    monkeypatch.setenv(
+        "BETX_LANES",
+        "gemini:agent-gemini-3.1-pro:fundamental:150, fable-5:agent-claude-fable-5:fundamental:125",
+    )
+    from betx.config import Config
+    cfg = Config(lanes_spec="gemini:agent-gemini-3.1-pro:fundamental:150,"
+                            "fable-5:agent-claude-fable-5:fundamental:125")
+    lanes = cfg.lanes
+    assert [(l.name, l.predictor, l.strategy, l.bankroll) for l in lanes] == [
+        ("gemini", "agent-gemini-3.1-pro", "fundamental", 150.0),
+        ("fable-5", "agent-claude-fable-5", "fundamental", 125.0),
+    ]
+    assert cfg.bet_predictors == ["agent-gemini-3.1-pro", "agent-claude-fable-5"]
+    assert [l.name for l in cfg.lanes_for("agent-claude-fable-5")] == ["fable-5"]
+
+
 def test_money_helpers():
     from betx.kalshi import count_of, market_quotes, money_usd
     o = {"taker_fees_dollars": "0.26", "taker_fees": 999999}      # dollars wins, never summed

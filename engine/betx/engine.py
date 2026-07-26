@@ -27,7 +27,7 @@ import psycopg
 from . import kalshi as kalshi_mod
 from . import strategies, sync
 from .arena import ArenaDB, ArenaMarketPrediction
-from .config import Config
+from .config import Config, Lane
 from .db import Store
 from .fees import taker_fee
 from .kalshi import KalshiClient, KalshiError
@@ -40,10 +40,10 @@ class LaneBook:
     are read once, then updated in memory as orders are placed — Supabase
     round-trips are ~300ms, so folding per candidate is prohibitive."""
 
-    def __init__(self, store: Store, cfg: Config, lane: str):
+    def __init__(self, store: Store, cfg: Config, lane: Lane):
         self.lane = lane
-        self.ledger = store.lane_ledger(cfg.instance_name, lane, cfg.lane_bankrolls[lane], include_dry_run=cfg.dry_run)
-        self.positions = store.lane_positions_all(cfg.instance_name, lane, include_dry_run=cfg.dry_run)
+        self.ledger = store.lane_ledger(cfg.instance_name, lane.name, lane.bankroll, include_dry_run=cfg.dry_run)
+        self.positions = store.lane_positions_all(cfg.instance_name, lane.name, include_dry_run=cfg.dry_run)
         self._dry_run = cfg.dry_run
 
     @property
@@ -67,17 +67,19 @@ class Engine:
         self.kalshi = kalshi
         self.arena = arena
         self._market_cache: dict[str, dict[str, Any]] = {}
+        self._ob_cache: dict[str, dict] = {}
         self._books: dict[str, LaneBook] = {}
 
     # ------------------------------------------------------------------ cycle
     def run_cycle(self) -> dict:
         cfg = self.cfg
         self._market_cache = {}
+        self._ob_cache = {}
         mode = "dry_run" if cfg.dry_run else "live"
         cycle_id = self.store.start_cycle(cfg.instance_name, mode)
         stats = {"markets_considered": 0, "predictions_made": 0, "bets_placed": 0}
         try:
-            self._books = {lane: LaneBook(self.store, cfg, lane) for lane in cfg.lanes}
+            self._books = {lane.name: LaneBook(self.store, cfg, lane) for lane in cfg.lanes}
             candidates = self._ingest(cycle_id, stats)
             random.shuffle(candidates)
             for cand, pred_row_id in candidates:
@@ -110,7 +112,7 @@ class Engine:
             # overlap buffer: arena rows can commit slightly out of created_at
             # order; the unique (source, external_id) constraint dedupes re-reads
             watermark -= dt.timedelta(minutes=10)
-        names = [cfg.arena_predictor] + [n for n in cfg.reference_predictors if n != cfg.arena_predictor]
+        names = list(dict.fromkeys(cfg.bet_predictors + cfg.reference_predictors))
         preds = self.arena.fetch_new_predictions(names, since=watermark)
         log.info("fetched %d (prediction x market) rows since %s", len(preds), watermark)
 
@@ -140,36 +142,40 @@ class Engine:
         inserted = self.store.insert_predictions_bulk(rows)
         stats["predictions_made"] += len(inserted)
 
+        bet_predictors = set(cfg.bet_predictors)
         bet_items: list[tuple[ArenaMarketPrediction, int]] = []
         for p in preds:
             row_id = inserted.get(f"{p.arena_prediction_id}:{p.ticker}")
-            if row_id is not None and p.predictor_name == cfg.arena_predictor:
+            if row_id is not None and p.predictor_name in bet_predictors:
                 bet_items.append((p, row_id))
 
-        # only the newest forecast per ticker trades; older ones are audited as superseded
-        newest: dict[str, tuple[ArenaMarketPrediction, int]] = {}
+        # only each predictor's newest forecast per ticker trades; older ones
+        # are audited as superseded
+        newest: dict[tuple[str, str], tuple[ArenaMarketPrediction, int]] = {}
         superseded: list[tuple[ArenaMarketPrediction, int]] = []
         for cand, rid in bet_items:
-            cur = newest.get(cand.ticker)
+            key = (cand.predictor_name, cand.ticker)
+            cur = newest.get(key)
             if cur is None or cand.predicted_at > cur[0].predicted_at:
                 if cur is not None:
                     superseded.append(cur)
-                newest[cand.ticker] = (cand, rid)
+                newest[key] = (cand, rid)
             else:
                 superseded.append((cand, rid))
         for cand, rid in superseded:
-            for lane in self.cfg.lanes:
-                self._save_skip(cycle_id, rid, lane, cand, "superseded")
+            for lane in cfg.lanes_for(cand.predictor_name):
+                self._save_skip(cycle_id, rid, lane.name, cand, "superseded")
         return list(newest.values())
 
     # ------------------------------------------------------------- candidates
     def _process_candidate(self, cand: ArenaMarketPrediction, pred_row_id: int, cycle_id: int) -> int:
         cfg = self.cfg
         now = dt.datetime.now(dt.timezone.utc)
+        lanes = cfg.lanes_for(cand.predictor_name)
         market = self._get_market(cand.ticker)
         if market is None:
-            for lane in cfg.lanes:
-                self._save_skip(cycle_id, pred_row_id, lane, cand, "market_not_found")
+            for lane in lanes:
+                self._save_skip(cycle_id, pred_row_id, lane.name, cand, "market_not_found")
             return 0
 
         close_time = _parse_ts(market.get("close_time")) or cand.close_time
@@ -186,28 +192,28 @@ class Engine:
         else:
             reason = None
         if reason:
-            for lane in cfg.lanes:
-                self._save_skip(cycle_id, pred_row_id, lane, cand, reason)
+            for lane in lanes:
+                self._save_skip(cycle_id, pred_row_id, lane.name, cand, reason)
             return 0
 
         try:
-            ob = self.kalshi.orderbook(cand.ticker)
+            ob = self._get_orderbook(cand.ticker)
         except KalshiError as e:
             log.warning("orderbook %s failed: %s", cand.ticker, e)
-            for lane in cfg.lanes:
-                self._save_skip(cycle_id, pred_row_id, lane, cand, "book_fetch_failed")
+            for lane in lanes:
+                self._save_skip(cycle_id, pred_row_id, lane.name, cand, "book_fetch_failed")
             return 0
         yes_asks, no_asks = strategies.ladders_from_orderbook(ob)
 
         placed = 0
-        for lane in cfg.lanes:
-            book = self._books[lane]
+        for lane in lanes:
+            book = self._books[lane.name]
             position = book.position(cand.ticker)
-            result = strategies.DECIDERS[lane](
+            result = strategies.DECIDERS[lane.strategy](
                 cand.p_model, yes_asks, no_asks, book.free_cash, position
             )
             placed += self._record_and_execute(
-                cycle_id, pred_row_id, lane, cand, result, book, position, yes_asks, no_asks
+                cycle_id, pred_row_id, lane.name, cand, result, book, position, yes_asks, no_asks
             )
         return placed
 
@@ -348,6 +354,13 @@ class Engine:
             m = None
         self._market_cache[ticker] = m or None
         return self._market_cache[ticker]
+
+    def _get_orderbook(self, ticker: str) -> dict:
+        """Per-cycle cache: two lanes' predictors can hit the same ticker in
+        one cycle; within a cycle they should decide off the same book."""
+        if ticker not in self._ob_cache:
+            self._ob_cache[ticker] = self.kalshi.orderbook(ticker)
+        return self._ob_cache[ticker]
 
     def _upsert_market(self, cand: ArenaMarketPrediction, market: dict, close_time) -> None:
         q = kalshi_mod.market_quotes(market)

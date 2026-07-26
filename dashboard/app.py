@@ -92,7 +92,8 @@ def build_payload() -> dict:
     )
 
     lanes = []
-    for lane, starting in cfg.lane_bankrolls.items():
+    for lane_def in cfg.lanes:
+        lane, starting = lane_def.name, lane_def.bankroll
         ledger = store.lane_ledger(inst, lane, starting, include_dry_run=cfg.dry_run)
         stats = store.query(
             """
@@ -120,6 +121,8 @@ def build_payload() -> dict:
         lanes.append(
             {
                 "lane": lane,
+                "predictor": lane_def.predictor,
+                "strategy": lane_def.strategy,
                 "starting_bankroll": starting,
                 "free_cash": ledger["free_cash"],
                 "reserved": ledger["reserved"],
@@ -192,7 +195,9 @@ def build_payload() -> dict:
     brier = []
     try:
         arena = ArenaDB(cfg.arena_database_url)
-        brier = arena.brier_snapshot([cfg.arena_predictor] + cfg.reference_predictors, since_days=45)
+        brier = arena.brier_snapshot(
+            list(dict.fromkeys(cfg.bet_predictors + cfg.reference_predictors)), since_days=45
+        )
     except Exception as e:
         log.warning("brier snapshot failed: %s", e)
 
@@ -204,7 +209,7 @@ def build_payload() -> dict:
             "as_of": now.isoformat(),
             "instance": inst,
             "mode": "dry_run" if cfg.dry_run else "live",
-            "predictor": cfg.arena_predictor,
+            "bet_predictors": cfg.bet_predictors,
             "reference_predictors": cfg.reference_predictors,
             "close_buffer_hours": cfg.close_buffer_hours,
             "account": {
@@ -285,7 +290,7 @@ def _empty_payload(warning: str) -> dict:
         "as_of": dt.datetime.now(dt.timezone.utc).isoformat(),
         "instance": cfg.instance_name,
         "mode": "dry_run" if cfg.dry_run else "live",
-        "predictor": cfg.arena_predictor,
+        "bet_predictors": cfg.bet_predictors,
         "reference_predictors": cfg.reference_predictors,
         "close_buffer_hours": cfg.close_buffer_hours,
         "account": {"balance_usd": None, "portfolio_value_usd": None, "equity_usd": None,

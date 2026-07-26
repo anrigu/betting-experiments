@@ -12,6 +12,16 @@ import os
 from dataclasses import dataclass, field
 
 
+@dataclass(frozen=True)
+class Lane:
+    """One virtual book: an arena predictor betting one strategy with its own
+    bankroll. All lanes share the physical Kalshi account."""
+    name: str
+    predictor: str
+    strategy: str          # "fundamental" | "momentum"
+    bankroll: float
+
+
 def _b(name: str, default: bool) -> bool:
     v = os.environ.get(name)
     if v is None:
@@ -41,14 +51,13 @@ class Config:
 
     # --- prediction source: ProphetArena production DB ---
     arena_database_url: str = os.environ.get("ARENA_DATABASE_URL", "")
-    # the lane model: agentic harness gemini-3.1-pro (won the paired Brier
-    # head-to-head vs the fixed-context variant on 603 common resolved events)
-    arena_predictor: str = os.environ.get("BETX_ARENA_PREDICTOR", "agent-gemini-3.1-pro")
     # ingested for dashboard Brier comparison only, never bet
     reference_predictors: list[str] = field(
         default_factory=lambda: [
             s.strip()
-            for s in os.environ.get("BETX_ARENA_REFERENCE_PREDICTORS", "gemini-3.1-pro").split(",")
+            for s in os.environ.get(
+                "BETX_ARENA_REFERENCE_PREDICTORS", "gemini-3.1-pro,claude-fable-5"
+            ).split(",")
             if s.strip()
         ]
     )
@@ -69,13 +78,14 @@ class Config:
     # no bets within this many hours of market close; fail-closed on missing close time
     close_buffer_hours: float = _f("BETX_CLOSE_BUFFER_HOURS", 24.0)
 
-    # --- lanes: {name: starting_bankroll_usd}; both trade the same account,
-    # attribution is per-order via the strategy column ---
-    lane_bankrolls: dict[str, float] = field(
-        default_factory=lambda: {
-            "momentum": _f("BETX_BANKROLL_MOMENTUM", 150.0),
-            "fundamental": _f("BETX_BANKROLL_FUNDAMENTAL", 150.0),
-        }
+    # --- lanes ---
+    # Two agents, one Kalshi account, virtually separated books: each lane is
+    # name:arena_predictor:strategy:bankroll_usd (comma-separated). Attribution
+    # is per-order via the strategy column, which stores the LANE NAME.
+    lanes_spec: str = os.environ.get(
+        "BETX_LANES",
+        "gemini:agent-gemini-3.1-pro:fundamental:150,"
+        "fable-5:agent-claude-fable-5:fundamental:150",
     )
 
     # --- optional own-schedule predictor mode (unused in arena-loop mode) ---
@@ -85,8 +95,26 @@ class Config:
     gemini_api_key: str = os.environ.get("GEMINI_API_KEY", "")
 
     @property
-    def lanes(self) -> list[str]:
-        return list(self.lane_bankrolls.keys())
+    def lanes(self) -> list["Lane"]:
+        out = []
+        for part in self.lanes_spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            name, predictor, strategy, bankroll = part.split(":")
+            if strategy not in ("fundamental", "momentum"):
+                raise RuntimeError(f"unknown lane strategy {strategy!r} in BETX_LANES")
+            out.append(Lane(name.strip(), predictor.strip(), strategy.strip(), float(bankroll)))
+        if len({l.name for l in out}) != len(out):
+            raise RuntimeError("duplicate lane names in BETX_LANES")
+        return out
+
+    @property
+    def bet_predictors(self) -> list[str]:
+        return list(dict.fromkeys(l.predictor for l in self.lanes))
+
+    def lanes_for(self, predictor: str) -> list["Lane"]:
+        return [l for l in self.lanes if l.predictor == predictor]
 
     @property
     def kalshi_private_key_pem(self) -> bytes:

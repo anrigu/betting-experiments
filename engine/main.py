@@ -2,10 +2,11 @@
 
     python engine/main.py [--once] [--dry-run]
 
-Polls the ProphetArena DB for new agent-gemini-3.1-pro predictions on a
-UTC-aligned boundary (default every 10 min), decides per lane (momentum /
-fundamental), executes on Kalshi, then reconciles orders/fills/settlements
-and snapshots account equity.
+Polls the ProphetArena DB for new predictions from each lane's agent on a
+UTC-aligned boundary (default every 10 min), decides per lane (see
+BETX_LANES: name:predictor:strategy:bankroll), executes on Kalshi, then
+reconciles orders/fills/settlements and snapshots account equity. All lanes
+share one Kalshi account; the books are kept separate virtually.
 """
 from __future__ import annotations
 
@@ -61,8 +62,9 @@ def main() -> None:
     engine = Engine(cfg, store, kalshi, arena)
 
     log.info(
-        "betx starting: instance=%s predictor=%s lanes=%s mode=%s interval=%ss",
-        cfg.instance_name, cfg.arena_predictor, cfg.lane_bankrolls,
+        "betx starting: instance=%s lanes=%s mode=%s interval=%ss",
+        cfg.instance_name,
+        [(l.name, l.predictor, l.strategy, l.bankroll) for l in cfg.lanes],
         "DRY_RUN" if cfg.dry_run else "LIVE", cfg.poll_interval_sec,
     )
 

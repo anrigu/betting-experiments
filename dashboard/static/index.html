@@ -15,8 +15,10 @@
     --grid:          #e1e0d9;
     --baseline:      #c3c2b7;
     --border:        rgba(11,11,11,0.10);
-    --series-1:      #2a78d6;   /* momentum */
-    --series-2:      #eb6834;   /* fundamental */
+    --series-1:      #2a78d6;   /* lane 1 */
+    --series-2:      #eb6834;   /* lane 2 */
+    --series-3:      #1baf7a;   /* lane 3 */
+    --series-4:      #eda100;   /* lane 4 */
     --good:          #0ca30c;
     --warning:       #fab219;
     --critical:      #d03b3b;
@@ -37,6 +39,8 @@
       --border:        rgba(255,255,255,0.10);
       --series-1:      #3987e5;
       --series-2:      #d95926;
+      --series-3:      #199e70;
+      --series-4:      #c98500;
       --delta-up:      #0ca30c;
       --chip-bg:       rgba(255,255,255,0.07);
     }
@@ -53,6 +57,8 @@
     --border:        rgba(255,255,255,0.10);
     --series-1:      #3987e5;
     --series-2:      #d95926;
+    --series-3:      #199e70;
+    --series-4:      #c98500;
     --delta-up:      #0ca30c;
     --chip-bg:       rgba(255,255,255,0.07);
   }
@@ -193,7 +199,14 @@
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
-const laneColors = { momentum: "var(--series-1)", fundamental: "var(--series-2)" };
+// lane identity colors: fixed categorical slots assigned in payload (config)
+// order — the color follows the lane, never its rank
+const PALETTE = ["var(--series-1)", "var(--series-2)", "var(--series-3)", "var(--series-4)"];
+let laneColors = {};
+const STRATEGY_DESC = {
+  fundamental: "fresh position each forecast, holds to settlement",
+  momentum: "force-to-target, nets & exits",
+};
 const fmt$ = (v, sign) => v == null ? "—" :
   (sign && v > 0 ? "+" : (sign && v < 0 ? "−" : "")) + "$" + Math.abs(v).toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2});
 const fmtN = (v) => v == null ? "—" : v.toLocaleString("en-US");
@@ -215,11 +228,13 @@ async function refresh() {
 function render() {
   const d = DATA;
   $("asof").textContent = "as of " + fmtTs(d.as_of);
+  (d.lanes || []).forEach((l, i) => { laneColors[l.lane] = PALETTE[i % PALETTE.length]; });
   const badge = $("mode-badge");
   badge.textContent = d.mode === "live" ? "LIVE" : "DRY RUN";
   badge.className = "chip " + (d.mode === "live" ? "badge-live" : "badge-dry");
-  $("predictor-chip").textContent = d.predictor;
-  $("foot-pred").textContent = d.predictor;
+  const preds = d.bet_predictors || [];
+  $("predictor-chip").textContent = preds.join("  vs  ") || "—";
+  $("foot-pred").textContent = preds.join(", ");
   $("foot-buffer").textContent = d.close_buffer_hours;
   $("engine-dot").style.background = d.engine_healthy ? "var(--good)" : "var(--critical)";
   const lastCycle = d.cycles && d.cycles[0];
@@ -257,7 +272,7 @@ function render() {
     return `<div class="lane-card" style="--lane-color:${laneColors[l.lane] || "var(--baseline)"}">
       <div class="lane-head">
         <span class="lane-name">${l.lane}</span>
-        <span class="lane-sub">${l.lane === "momentum" ? "force-to-target, nets & exits" : "fresh position each forecast, holds to settlement"}
+        <span class="lane-sub">${l.predictor || ""} · ${STRATEGY_DESC[l.strategy] || l.strategy || ""}
           · bankroll ${fmt$(l.starting_bankroll)}</span>
       </div>
       <div class="lane-grid">
@@ -364,16 +379,18 @@ function renderChart() {
 function renderBrier(brier) {
   if (!brier || !brier.length) { $("brier").innerHTML = `<div class="empty">No resolved events yet</div>`; return; }
   const max = Math.max(...brier.map(b => b.brier), 0.25);
+  const laneForPred = {};
+  (DATA.lanes || []).forEach(l => { if (!(l.predictor in laneForPred)) laneForPred[l.predictor] = l.lane; });
   $("brier").innerHTML = `<table><thead><tr><th>Predictor</th><th>Harness</th><th class="num">Events</th><th class="num">Brier</th><th style="width:38%"></th></tr></thead><tbody>` +
     brier.sort((a, b) => a.brier - b.brier).map(b => {
-      const isBet = b.predictor === DATA.predictor;
+      const isBet = (DATA.bet_predictors || []).includes(b.predictor);
       const w = Math.max(2, b.brier / max * 100);
       return `<tr>
         <td>${isBet ? "<b>" + b.predictor + "</b> <span class='muted small'>(betting)</span>" : b.predictor}</td>
         <td class="muted">${b.predictor.startsWith("agent-") ? "agentic" : "fixed-context"}</td>
         <td class="num">${fmtN(b.events)}</td>
         <td class="num"><b>${b.brier.toFixed(4)}</b></td>
-        <td><div style="height:10px;border-radius:3px;width:${w}%;background:${isBet ? "var(--series-1)" : "var(--baseline)"}"></div></td>
+        <td><div style="height:10px;border-radius:3px;width:${w}%;background:${isBet ? (laneColors[laneForPred[b.predictor]] || "var(--series-1)") : "var(--baseline)"}"></div></td>
       </tr>`;
     }).join("") + "</tbody></table>";
 }

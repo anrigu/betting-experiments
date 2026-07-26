@@ -6,10 +6,14 @@ a live dashboard.
 
 ## The experiment
 
-- **Model**: `agent-gemini-3.1-pro` — gemini-3.1-pro-preview on ProphetArena's agentic
-  (web-search) harness. Chosen over the fixed-context variant `gemini-3.1-pro` by paired Brier
-  head-to-head on common resolved events (0.1434 vs 0.1494 over ~600 events); the dashboard keeps
-  tracking both.
+**Two agents, one Kalshi account, virtually separated books.** Each lane is an arena agent
+betting the **fundamental** strategy with its own bankroll; attribution is per-order, so the
+shared account decomposes exactly into per-lane ledgers.
+
+- **Lanes** (`BETX_LANES`, `name:predictor:strategy:bankroll`):
+  - `gemini` — `agent-gemini-3.1-pro` (gemini-3.1-pro-preview, agentic web-search harness)
+  - `fable-5` — `agent-claude-fable-5` (Claude Fable 5, agentic harness)
+  Fixed-context variants of both are ingested as references for the dashboard's Brier panel.
 - **Prediction source**: looped directly from ProphetArena's production DB (no LLM spend). The
   engine polls for new predictions every 10 minutes and maps each event outcome to its Kalshi
   ticker.
@@ -20,12 +24,10 @@ a live dashboard.
      `kalshi_fee = ⌈0.07 · C · P · (1−P)⌉` (venue-exact, whole-order ceil).
   2. *No betting within 24h of close* (fail-closed on missing close time).
   3. Mechanical guards: `thin_book` (skip entirely, never shrink or walk the book),
-     `insufficient_cash`, `at_target`, `superseded`.
-- **Two lanes**, same account, per-order attribution:
-  - `momentum` — force-to-target: the newest forecast fully determines the signed position; the
-    delta trades as one limit buy (Kalshi nets YES/NO). Within-band forecast ⇒ exit to flat.
-  - `fundamental` — identical math decided as if flat every forecast: accumulates gross exposure,
-    never reduces, rides to settlement.
+     `insufficient_cash`, `superseded`.
+- **Strategy `fundamental`** — every new forecast opens a fresh `floor(edge × 100)`-contract
+  position as if flat: gross exposure accumulates, never reduces, rides to settlement.
+  (A `momentum` force-to-target strategy is also implemented and lane-selectable.)
 - **Sizing**: `floor(edge × 100)` contracts (proper-Brier linear rule). No Kelly.
 - **Execution**: limit buys at the ask with 5-minute venue-side expiration; depth pre-checked.
 - **Account**: the funded Kalshi account (RSA-PSS signed trade-api v2; credentials via env).
@@ -56,7 +58,7 @@ render.yaml       Render blueprint (worker + dashboard)
 |---|---|
 | `BETX_DRY_RUN=true` | decide + audit everything, simulate fills, never touch Kalshi orders |
 | `BETX_LIVE_ENABLED=false` | master kill switch: decisions recorded, zero orders (not even dry-run rows) |
-| `BETX_BANKROLL_MOMENTUM` / `BETX_BANKROLL_FUNDAMENTAL` | per-lane bankrolls (default $150 each) |
+| `BETX_LANES` | `name:arena_predictor:strategy:bankroll,...` (default: gemini + fable-5, fundamental, $150 each) |
 
 **Going live is one flip:** set `BETX_DRY_RUN=false` on the `betx-engine` Render service.
 

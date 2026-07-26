@@ -269,15 +269,15 @@ def snapshot_sim_equity(store: Store, cfg: Config) -> None:
         r["ticker"]: r
         for r in store.query("SELECT ticker, yes_bid, no_bid, last_price FROM {s}.markets")
     }
-    for lane, starting in cfg.lane_bankrolls.items():
-        ledger = store.lane_ledger(cfg.instance_name, lane, starting, include_dry_run=True)
+    for lane in cfg.lanes:
+        ledger = store.lane_ledger(cfg.instance_name, lane.name, lane.bankroll, include_dry_run=True)
         total_cash += ledger["free_cash"] + ledger["reserved"] - ledger["netting"]
-        positions = store.lane_positions_all(cfg.instance_name, lane, include_dry_run=True)
+        positions = store.lane_positions_all(cfg.instance_name, lane.name, include_dry_run=True)
         pairs = store.query(
             "SELECT ticker, COALESCE(SUM(filled_count) FILTER (WHERE side='yes'),0) AS y, "
             "COALESCE(SUM(filled_count) FILTER (WHERE side='no'),0) AS n FROM {s}.orders "
             "WHERE instance = %s AND strategy = %s AND settled_at IS NULL AND dry_run = TRUE GROUP BY ticker",
-            (cfg.instance_name, lane),
+            (cfg.instance_name, lane.name),
         )
         netted = {p["ticker"]: min(int(p["y"]), int(p["n"])) for p in pairs}
         for ticker, pos in positions.items():

@@ -145,7 +145,7 @@ def build_payload() -> dict:
         SELECT o.created_at, o.strategy, o.ticker, o.title, o.category, o.side, o.count,
                o.limit_price_cents, o.status, o.filled_count, o.avg_fill_price_cents,
                o.fees_usd, o.settled_at, o.settlement_result, o.realized_pnl_usd, o.dry_run,
-               d.edge, d.detail->>'p_model' AS p_model
+               d.edge, d.p_model
         FROM {s}.orders o LEFT JOIN {s}.decisions d ON d.id = o.decision_id
         WHERE o.instance = %s ORDER BY o.created_at DESC LIMIT 200
         """,

@@ -106,6 +106,10 @@ class Engine:
         watermark = self.store.prediction_watermark(cfg.instance_name, "arena")
         if watermark is None:
             watermark = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=cfg.backfill_hours)
+        else:
+            # overlap buffer: arena rows can commit slightly out of created_at
+            # order; the unique (source, external_id) constraint dedupes re-reads
+            watermark -= dt.timedelta(minutes=10)
         names = [cfg.arena_predictor] + [n for n in cfg.reference_predictors if n != cfg.arena_predictor]
         preds = self.arena.fetch_new_predictions(names, since=watermark)
         log.info("fetched %d (prediction x market) rows since %s", len(preds), watermark)

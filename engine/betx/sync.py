@@ -169,8 +169,8 @@ def _attribute_settlements(store: Store, cfg: Config) -> None:
         if result in ("yes", "no"):
             won = result == r["side"]
             revenue = filled * 1.0 if won else 0.0
-        else:  # void / scalar — treat as refund of cost
-            revenue = cost
+        else:  # void / scalar — venue refunds cost AND fees; never book a phantom loss
+            revenue = cost + fees
         pnl = round(revenue - cost - fees, 4)
         store.execute(
             "UPDATE {s}.orders SET settled_at = %s, settlement_result = %s, "

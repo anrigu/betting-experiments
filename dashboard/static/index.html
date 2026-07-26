@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Betting Experiments — Live Dashboard</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page:          #f9f9f7;
+    --surface-1:     #fcfcfb;
+    --text-primary:  #0b0b0b;
+    --text-secondary:#52514e;
+    --text-muted:    #898781;
+    --grid:          #e1e0d9;
+    --baseline:      #c3c2b7;
+    --border:        rgba(11,11,11,0.10);
+    --series-1:      #2a78d6;   /* momentum */
+    --series-2:      #eb6834;   /* fundamental */
+    --good:          #0ca30c;
+    --warning:       #fab219;
+    --critical:      #d03b3b;
+    --delta-up:      #006300;
+    --delta-down:    #d03b3b;
+    --chip-bg:       rgba(11,11,11,0.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page:          #0d0d0d;
+      --surface-1:     #1a1a19;
+      --text-primary:  #ffffff;
+      --text-secondary:#c3c2b7;
+      --text-muted:    #898781;
+      --grid:          #2c2c2a;
+      --baseline:      #383835;
+      --border:        rgba(255,255,255,0.10);
+      --series-1:      #3987e5;
+      --series-2:      #d95926;
+      --delta-up:      #0ca30c;
+      --chip-bg:       rgba(255,255,255,0.07);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:          #0d0d0d;
+    --surface-1:     #1a1a19;
+    --text-primary:  #ffffff;
+    --text-secondary:#c3c2b7;
+    --text-muted:    #898781;
+    --grid:          #2c2c2a;
+    --baseline:      #383835;
+    --border:        rgba(255,255,255,0.10);
+    --series-1:      #3987e5;
+    --series-2:      #d95926;
+    --delta-up:      #0ca30c;
+    --chip-bg:       rgba(255,255,255,0.07);
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--page); color: var(--text-primary);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 20px; max-width: 1240px; margin: 0 auto;
+  }
+  h1 { font-size: 19px; font-weight: 650; letter-spacing: -0.01em; }
+  h2 { font-size: 13px; font-weight: 600; color: var(--text-secondary);
+       text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; }
+  .topbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px;
+          border: 1px solid var(--border); border-radius: 999px; font-size: 12px;
+          color: var(--text-secondary); background: var(--chip-bg); }
+  .chip .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .badge-live { color: #fff; background: var(--good); border-color: transparent; font-weight: 600; }
+  .badge-dry  { color: #4a3500; background: var(--warning); border-color: transparent; font-weight: 600; }
+  .subline { color: var(--text-muted); font-size: 12.5px; margin-bottom: 18px; }
+  .subline b { color: var(--text-secondary); font-weight: 600; }
+  section { background: var(--surface-1); border: 1px solid var(--border);
+            border-radius: 10px; padding: 16px 18px; margin-bottom: 16px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .tile { padding: 4px 2px; }
+  .tile .label { font-size: 12px; color: var(--text-muted); margin-bottom: 2px; }
+  .tile .value { font-size: 24px; font-weight: 650; letter-spacing: -0.01em; }
+  .tile .sub { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+  .up   { color: var(--delta-up); }
+  .down { color: var(--delta-down); }
+  .lanes { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; margin-bottom: 16px; }
+  .lane-card { background: var(--surface-1); border: 1px solid var(--border);
+               border-left: 4px solid var(--lane-color); border-radius: 10px; padding: 14px 18px; }
+  .lane-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+  .lane-name { font-size: 15px; font-weight: 650; text-transform: capitalize; }
+  .lane-sub { font-size: 12px; color: var(--text-muted); }
+  .lane-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px 14px; }
+  .lane-grid .label { font-size: 11px; color: var(--text-muted); }
+  .lane-grid .v { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .rangetabs { display: inline-flex; gap: 2px; border: 1px solid var(--border);
+               border-radius: 7px; padding: 2px; margin-left: auto; }
+  .rangetabs button { border: 0; background: transparent; color: var(--text-secondary);
+                      font: 12px system-ui; padding: 3px 10px; border-radius: 5px; cursor: pointer; }
+  .rangetabs button.active { background: var(--chip-bg); color: var(--text-primary); font-weight: 600; }
+  .sec-head { display: flex; align-items: center; margin-bottom: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; font-size: 11.5px; color: var(--text-muted); font-weight: 600;
+       padding: 6px 8px; border-bottom: 1px solid var(--grid);
+       text-transform: uppercase; letter-spacing: 0.04em; white-space: nowrap; }
+  td { padding: 7px 8px; border-bottom: 1px solid var(--grid);
+       font-variant-numeric: tabular-nums; vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  td.num, th.num { text-align: right; }
+  .lane-mark { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+               margin-right: 6px; vertical-align: baseline; }
+  .muted { color: var(--text-muted); }
+  .small { font-size: 12px; }
+  .status-pill { display: inline-block; padding: 1px 8px; border-radius: 999px;
+                 font-size: 11.5px; font-weight: 600; background: var(--chip-bg);
+                 color: var(--text-secondary); }
+  .status-executed, .status-dry_run { color: var(--delta-up); }
+  .status-failed { color: var(--critical); }
+  .scroll-x { overflow-x: auto; }
+  .empty { color: var(--text-muted); font-size: 13px; padding: 14px 0; text-align: center; }
+  #tooltip { position: fixed; pointer-events: none; background: var(--surface-1);
+             border: 1px solid var(--border); border-radius: 7px; padding: 7px 10px;
+             font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,0.15); display: none; z-index: 10; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 860px) { .two-col { grid-template-columns: 1fr; } }
+  .foot { color: var(--text-muted); font-size: 12px; margin: 6px 0 24px; }
+  a { color: var(--series-1); text-decoration: none; }
+  details summary { cursor: pointer; color: var(--text-secondary); font-size: 13px; }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <h1>Betting Experiments</h1>
+    <span id="mode-badge" class="chip">…</span>
+    <span class="chip" id="engine-chip"><span class="dot" id="engine-dot" style="background:var(--text-muted)"></span><span id="engine-text">engine —</span></span>
+    <span class="chip" id="predictor-chip">predictor —</span>
+    <span class="chip muted" id="asof">loading…</span>
+  </div>
+  <div class="subline" id="account-line">Connecting…</div>
+
+  <section>
+    <div class="tiles" id="kpis"></div>
+  </section>
+
+  <div class="lanes" id="lanes"></div>
+
+  <section>
+    <div class="sec-head">
+      <h2>Account equity over time</h2>
+      <div class="rangetabs" id="ranges"></div>
+    </div>
+    <div id="chart-wrap" style="position:relative"></div>
+  </section>
+
+  <div class="two-col">
+    <section>
+      <h2>Harness Brier (rolling 45d, resolved arena events — lower is better)</h2>
+      <div id="brier"></div>
+    </section>
+    <section>
+      <h2>LLM running costs</h2>
+      <div id="llm"></div>
+    </section>
+  </div>
+
+  <section>
+    <h2>Open holdings</h2>
+    <div class="scroll-x" id="holdings"></div>
+  </section>
+
+  <section>
+    <h2>Bets (latest 200)</h2>
+    <div class="scroll-x" id="orders"></div>
+  </section>
+
+  <div class="two-col">
+    <section>
+      <h2>Skip reasons</h2>
+      <div class="scroll-x" id="skips"></div>
+    </section>
+    <section>
+      <h2>Engine cycles</h2>
+      <div class="scroll-x" id="cycles"></div>
+    </section>
+  </div>
+
+  <p class="foot">
+    Predictions looped from ProphetArena (<span id="foot-pred">—</span>) · gates: fee-aware within-spread + no bets within <span id="foot-buffer">24</span>h of close ·
+    all categories · sizing floor(edge×100) contracts · limit buys at ask, 5-min expiration · fees ⌈0.07·C·P·(1−P)⌉ ·
+    data: Supabase <code>betting_experiments</code> · refreshes every 60s.
+  </p>
+  <div id="tooltip"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const laneColors = { momentum: "var(--series-1)", fundamental: "var(--series-2)" };
+const fmt$ = (v, sign) => v == null ? "—" :
+  (sign && v > 0 ? "+" : (sign && v < 0 ? "−" : "")) + "$" + Math.abs(v).toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const fmtN = (v) => v == null ? "—" : v.toLocaleString("en-US");
+const fmtPct = (v) => v == null ? "—" : (v * 100).toFixed(1) + "%";
+const fmtTs = (s) => s ? new Date(s).toLocaleString([], {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"}) : "—";
+const cls = (v) => v == null ? "" : (v > 0 ? "up" : v < 0 ? "down" : "");
+let DATA = null, range = "7D";
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/overview", {cache: "no-store"});
+    DATA = await r.json();
+    render();
+  } catch (e) {
+    $("asof").textContent = "fetch failed — retrying";
+  }
+}
+
+function render() {
+  const d = DATA;
+  $("asof").textContent = "as of " + fmtTs(d.as_of);
+  const badge = $("mode-badge");
+  badge.textContent = d.mode === "live" ? "LIVE" : "DRY RUN";
+  badge.className = "chip " + (d.mode === "live" ? "badge-live" : "badge-dry");
+  $("predictor-chip").textContent = d.predictor;
+  $("foot-pred").textContent = d.predictor;
+  $("foot-buffer").textContent = d.close_buffer_hours;
+  $("engine-dot").style.background = d.engine_healthy ? "var(--good)" : "var(--critical)";
+  const lastCycle = d.cycles && d.cycles[0];
+  $("engine-text").textContent = "engine " + (d.engine_healthy ? "healthy" : "stale") +
+    (lastCycle ? " · last cycle " + fmtTs(lastCycle.finished_at || lastCycle.started_at) : "");
+
+  const a = d.account;
+  $("account-line").innerHTML = a.equity_usd == null
+    ? "No account snapshot yet" + (d.warning ? " · <span class='down'>" + d.warning + "</span>" : "")
+    : `Kalshi account: <b>${fmt$(a.equity_usd)}</b> = cash ${fmt$(a.balance_usd)} + open positions ${fmt$(a.portfolio_value_usd)}
+       · ${fmtN(a.open_positions)} open · venue snapshot ${fmtTs(a.snapshot_at)}`;
+
+  // KPI tiles
+  const lanes = d.lanes || [];
+  const mtmTotal = lanes.reduce((s, l) => s + (l.mtm_equity || 0), 0);
+  const startTotal = lanes.reduce((s, l) => s + (l.starting_bankroll || 0), 0);
+  const unrealTotal = lanes.reduce((s, l) => s + (l.unrealized || 0), 0);
+  const betsTotal = lanes.reduce((s, l) => s + (l.orders || 0), 0);
+  const pnlTotal = mtmTotal - startTotal;
+  $("kpis").innerHTML = [
+    tile("Experiment value", fmt$(mtmTotal), `start ${fmt$(startTotal)}`),
+    tile("Experiment P&L", `<span class="${cls(pnlTotal)}">${fmt$(pnlTotal, true)}</span>`, `${fmtPct(startTotal ? pnlTotal/startTotal : null)} on bankroll`),
+    tile("Realized P&L", `<span class="${cls(d.totals.realized_pnl)}">${fmt$(d.totals.realized_pnl, true)}</span>`, "settled markets"),
+    tile("Unrealized", `<span class="${cls(unrealTotal)}">${fmt$(unrealTotal, true)}</span>`, "marked to venue bid"),
+    tile("Fees paid", fmt$(d.totals.fees), "venue-reported"),
+    tile("LLM cost", fmt$(d.totals.llm_cost), d.totals.llm_calls ? `${fmtN(d.totals.llm_calls)} calls` : "arena predictions: free"),
+    tile("Bets placed", fmtN(betsTotal), `${fmtN(lanes.reduce((s,l)=>s+(l.skips||0),0))} skips`),
+  ].join("");
+
+  // Lane cards
+  $("lanes").innerHTML = lanes.map(l => {
+    const winRate = l.settled ? l.wins / l.settled : null;
+    return `<div class="lane-card" style="--lane-color:${laneColors[l.lane] || "var(--baseline)"}">
+      <div class="lane-head">
+        <span class="lane-name">${l.lane}</span>
+        <span class="lane-sub">${l.lane === "momentum" ? "force-to-target, nets & exits" : "fresh position each forecast, holds to settlement"}
+          · bankroll ${fmt$(l.starting_bankroll)}</span>
+      </div>
+      <div class="lane-grid">
+        ${lv("Market value", fmt$(l.mtm_equity))}
+        ${lv("Free cash", fmt$(l.free_cash))}
+        ${lv("Realized", `<span class="${cls(l.realized)}">${fmt$(l.realized, true)}</span>`)}
+        ${lv("Unrealized", `<span class="${cls(l.unrealized)}">${fmt$(l.unrealized, true)}</span>`)}
+        ${lv("ROI (settled)", fmtPct(l.roi_settled))}
+        ${lv("Win rate", winRate == null ? "—" : `${fmtPct(winRate)} <span class="muted small">(${l.wins}/${l.settled})</span>`)}
+        ${lv("Fees", fmt$(l.fees))}
+        ${lv("Activity", `${fmtN(l.orders)} bets · ${fmtN(l.skips)} skips · ${fmtN(l.open_markets)} open`)}
+      </div>
+    </div>`;
+  }).join("") || `<section class="empty">No lanes yet</section>`;
+
+  renderRanges();
+  renderChart();
+  renderBrier(d.brier);
+  renderLLM(d);
+  renderHoldings(lanes);
+  renderOrders(d.orders);
+  renderSkips(d.skip_summary);
+  renderCycles(d.cycles);
+}
+
+const tile = (label, value, sub) =>
+  `<div class="tile"><div class="label">${label}</div><div class="value">${value}</div><div class="sub">${sub || ""}</div></div>`;
+const lv = (label, v) => `<div><div class="label">${label}</div><div class="v">${v}</div></div>`;
+
+function renderRanges() {
+  const opts = ["24H", "7D", "ALL"];
+  $("ranges").innerHTML = opts.map(o =>
+    `<button class="${o === range ? "active" : ""}" onclick="setRange('${o}')">${o}</button>`).join("");
+}
+function setRange(r) { range = r; renderRanges(); renderChart(); }
+
+function renderChart() {
+  const wrap = $("chart-wrap");
+  const pts = (DATA.equity_series || [])
+    .map(p => ({ t: new Date(p.bucket).getTime(), v: p.equity_usd }))
+    .filter(p => p.v != null)
+    .sort((x, y) => x.t - y.t);
+  const now = Date.now();
+  const cut = range === "24H" ? now - 864e5 : range === "7D" ? now - 7 * 864e5 : 0;
+  const shown = pts.filter(p => p.t >= cut);
+  if (shown.length < 2) {
+    wrap.innerHTML = `<div class="empty">${pts.length ? "No snapshots in this window" : "Building equity history — first snapshots land after the next live cycle"}</div>`;
+    return;
+  }
+  const W = Math.min(wrap.clientWidth || 1100, 1200), H = 260;
+  const padL = 56, padR = 14, padT = 12, padB = 26;
+  const t0 = shown[0].t, t1 = shown[shown.length - 1].t;
+  let v0 = Math.min(...shown.map(p => p.v)), v1 = Math.max(...shown.map(p => p.v));
+  const startTotal = (DATA.lanes || []).reduce((s, l) => s + (l.starting_bankroll || 0), 0);
+  if (startTotal) { v0 = Math.min(v0, startTotal); v1 = Math.max(v1, startTotal); }
+  const span = Math.max(v1 - v0, 1); v0 -= span * 0.08; v1 += span * 0.08;
+  const X = t => padL + (t - t0) / Math.max(t1 - t0, 1) * (W - padL - padR);
+  const Y = v => padT + (1 - (v - v0) / (v1 - v0)) * (H - padT - padB);
+  // stepAfter path
+  let path = `M ${X(shown[0].t)} ${Y(shown[0].v)}`;
+  for (let i = 1; i < shown.length; i++)
+    path += ` H ${X(shown[i].t)} V ${Y(shown[i].v)}`;
+  const yticks = 4, grid = [], labels = [];
+  for (let i = 0; i <= yticks; i++) {
+    const v = v0 + (v1 - v0) * i / yticks, y = Y(v);
+    grid.push(`<line x1="${padL}" x2="${W - padR}" y1="${y}" y2="${y}" stroke="var(--grid)" stroke-width="1"/>`);
+    labels.push(`<text x="${padL - 8}" y="${y + 4}" text-anchor="end" font-size="11" fill="var(--text-muted)" style="font-variant-numeric:tabular-nums">$${v.toFixed(0)}</text>`);
+  }
+  const xn = Math.min(6, shown.length);
+  for (let i = 0; i < xn; i++) {
+    const t = t0 + (t1 - t0) * i / (xn - 1 || 1);
+    labels.push(`<text x="${X(t)}" y="${H - 8}" text-anchor="middle" font-size="11" fill="var(--text-muted)">${new Date(t).toLocaleString([], range === "24H" ? {hour:"2-digit",minute:"2-digit"} : {month:"short",day:"numeric"})}</text>`);
+  }
+  const ref = startTotal ? `<line x1="${padL}" x2="${W - padR}" y1="${Y(startTotal)}" y2="${Y(startTotal)}" stroke="var(--baseline)" stroke-width="1" stroke-dasharray="4 4"/>
+    <text x="${W - padR}" y="${Y(startTotal) - 5}" text-anchor="end" font-size="10.5" fill="var(--text-muted)">start $${startTotal.toFixed(0)}</text>` : "";
+  wrap.innerHTML = `<svg id="eqsvg" viewBox="0 0 ${W} ${H}" width="100%" height="${H}" role="img" aria-label="Account equity over time">
+    ${grid.join("")}${ref}
+    <path d="${path}" fill="none" stroke="var(--series-1)" stroke-width="2" stroke-linejoin="round"/>
+    ${labels.join("")}
+    <line id="xh" y1="${padT}" y2="${H - padB}" stroke="var(--baseline)" stroke-width="1" style="display:none"/>
+    <circle id="xhc" r="4" fill="var(--series-1)" stroke="var(--surface-1)" stroke-width="2" style="display:none"/>
+  </svg>`;
+  const svg = $("eqsvg"), tip = $("tooltip");
+  svg.addEventListener("mousemove", ev => {
+    const r = svg.getBoundingClientRect();
+    const mx = (ev.clientX - r.left) / r.width * W;
+    const t = t0 + (mx - padL) / (W - padL - padR) * (t1 - t0);
+    let best = shown[0];
+    for (const p of shown) if (Math.abs(p.t - t) < Math.abs(best.t - t)) best = p;
+    const x = X(best.t), y = Y(best.v);
+    const xh = $("xh"), c = $("xhc");
+    xh.setAttribute("x1", x); xh.setAttribute("x2", x); xh.style.display = "";
+    c.setAttribute("cx", x); c.setAttribute("cy", y); c.style.display = "";
+    tip.style.display = "block";
+    tip.style.left = (ev.clientX + 14) + "px";
+    tip.style.top = (ev.clientY - 12) + "px";
+    tip.innerHTML = `<b>${fmt$(best.v)}</b><br><span class="muted">${fmtTs(new Date(best.t).toISOString())}</span>`;
+  });
+  svg.addEventListener("mouseleave", () => {
+    $("xh").style.display = "none"; $("xhc").style.display = "none"; $("tooltip").style.display = "none";
+  });
+}
+
+function renderBrier(brier) {
+  if (!brier || !brier.length) { $("brier").innerHTML = `<div class="empty">No resolved events yet</div>`; return; }
+  const max = Math.max(...brier.map(b => b.brier), 0.25);
+  $("brier").innerHTML = `<table><thead><tr><th>Predictor</th><th>Harness</th><th class="num">Events</th><th class="num">Brier</th><th style="width:38%"></th></tr></thead><tbody>` +
+    brier.sort((a, b) => a.brier - b.brier).map(b => {
+      const isBet = b.predictor === DATA.predictor;
+      const w = Math.max(2, b.brier / max * 100);
+      return `<tr>
+        <td>${isBet ? "<b>" + b.predictor + "</b> <span class='muted small'>(betting)</span>" : b.predictor}</td>
+        <td class="muted">${b.predictor.startsWith("agent-") ? "agentic" : "fixed-context"}</td>
+        <td class="num">${fmtN(b.events)}</td>
+        <td class="num"><b>${b.brier.toFixed(4)}</b></td>
+        <td><div style="height:10px;border-radius:3px;width:${w}%;background:${isBet ? "var(--series-1)" : "var(--baseline)"}"></div></td>
+      </tr>`;
+    }).join("") + "</tbody></table>";
+}
+
+function renderLLM(d) {
+  const t = d.totals;
+  let html = `<div class="tiles" style="grid-template-columns:repeat(3,1fr);margin-bottom:8px">
+    ${tile("Total", fmt$(t.llm_cost), "")}
+    ${tile("Calls", fmtN(t.llm_calls), "")}
+    ${tile("Tokens", fmtN((t.llm_tokens_in || 0) + (t.llm_tokens_out || 0)), `${fmtN(t.llm_tokens_in)} in / ${fmtN(t.llm_tokens_out)} out`)}
+  </div>`;
+  if (!t.llm_calls) {
+    html += `<div class="muted small">This experiment loops predictions already made on ProphetArena, so no direct LLM spend is incurred.
+             If the engine switches to its own prediction schedule (predictor mode), per-call token costs land here.</div>`;
+  } else if (d.llm_by_day && d.llm_by_day.length) {
+    html += `<table><thead><tr><th>Day</th><th class="num">Calls</th><th class="num">Cost</th></tr></thead><tbody>` +
+      d.llm_by_day.map(r => `<tr><td>${r.day}</td><td class="num">${fmtN(r.calls)}</td><td class="num">${fmt$(r.cost)}</td></tr>`).join("") +
+      "</tbody></table>";
+  }
+  $("llm").innerHTML = html;
+}
+
+function renderHoldings(lanes) {
+  const rows = [];
+  for (const l of lanes) for (const h of (l.holdings || [])) rows.push({lane: l.lane, ...h});
+  if (!rows.length) { $("holdings").innerHTML = `<div class="empty">No open positions</div>`; return; }
+  rows.sort((a, b) => Math.abs(b.value_usd) - Math.abs(a.value_usd));
+  $("holdings").innerHTML = `<table><thead><tr>
+    <th>Lane</th><th>Market</th><th class="num">Position</th><th class="num">Mark</th>
+    <th class="num">Value</th><th class="num">Cost</th><th class="num">Unrealized</th><th>Closes</th>
+  </tr></thead><tbody>` + rows.map(h => {
+    const unreal = h.value_usd - h.cost_usd;
+    return `<tr>
+      <td><span class="lane-mark" style="background:${laneColors[h.lane]}"></span>${h.lane}</td>
+      <td><a href="https://kalshi.com/markets/${h.ticker}" target="_blank" rel="noopener">${h.ticker}</a>
+          <div class="muted small">${h.title || ""}</div></td>
+      <td class="num">${h.position > 0 ? h.position + " YES" : h.position < 0 ? (-h.position) + " NO" : "flat"}${h.netted_pairs ? `<div class="muted small">${h.netted_pairs} netted pair${h.netted_pairs > 1 ? "s" : ""}</div>` : ""}</td>
+      <td class="num">${h.mark != null ? (h.mark * 100).toFixed(0) + "¢" : "—"}</td>
+      <td class="num">${fmt$(h.value_usd)}</td>
+      <td class="num">${fmt$(h.cost_usd)}</td>
+      <td class="num ${cls(unreal)}">${fmt$(unreal, true)}</td>
+      <td class="small muted">${fmtTs(h.close_time)}</td>
+    </tr>`;
+  }).join("") + "</tbody></table>";
+}
+
+function renderOrders(orders) {
+  if (!orders || !orders.length) { $("orders").innerHTML = `<div class="empty">No bets yet — the engine bets when a new arena prediction clears the spread+fee gate</div>`; return; }
+  $("orders").innerHTML = `<table><thead><tr>
+    <th>Placed</th><th>Lane</th><th>Market</th><th>Side</th><th class="num">Ct</th>
+    <th class="num">Limit</th><th class="num">P (model)</th><th class="num">Edge</th>
+    <th>Status</th><th class="num">Filled</th><th class="num">Fees</th><th>Result</th><th class="num">P&L</th>
+  </tr></thead><tbody>` + orders.map(o => `<tr>
+    <td class="small">${fmtTs(o.created_at)}</td>
+    <td><span class="lane-mark" style="background:${laneColors[o.strategy]}"></span>${o.strategy}</td>
+    <td><a href="https://kalshi.com/markets/${o.ticker}" target="_blank" rel="noopener">${o.ticker}</a>
+        <div class="muted small">${(o.title || "").slice(0, 70)}</div></td>
+    <td>${(o.side || "").toUpperCase()}</td>
+    <td class="num">${fmtN(o.count)}</td>
+    <td class="num">${o.limit_price_cents != null ? o.limit_price_cents + "¢" : "—"}</td>
+    <td class="num">${o.p_model != null ? (parseFloat(o.p_model) * 100).toFixed(0) + "%" : "—"}</td>
+    <td class="num">${o.edge != null ? (o.edge * 100).toFixed(1) + "¢" : "—"}</td>
+    <td><span class="status-pill status-${o.status}">${o.status}${o.dry_run ? " (dry)" : ""}</span></td>
+    <td class="num">${fmtN(o.filled_count)}</td>
+    <td class="num">${fmt$(o.fees_usd)}</td>
+    <td class="small">${o.settlement_result ? o.settlement_result.toUpperCase() : "<span class='muted'>open</span>"}</td>
+    <td class="num ${cls(o.realized_pnl_usd)}">${o.realized_pnl_usd != null ? fmt$(o.realized_pnl_usd, true) : "—"}</td>
+  </tr>`).join("") + "</tbody></table>";
+}
+
+function renderSkips(sk) {
+  if (!sk || !sk.length) { $("skips").innerHTML = `<div class="empty">No skips yet</div>`; return; }
+  $("skips").innerHTML = `<table><thead><tr><th>Lane</th><th>Reason</th><th class="num">Count</th></tr></thead><tbody>` +
+    sk.map(s => `<tr>
+      <td><span class="lane-mark" style="background:${laneColors[s.strategy]}"></span>${s.strategy}</td>
+      <td>${s.skip_reason}</td><td class="num">${fmtN(s.n)}</td></tr>`).join("") + "</tbody></table>";
+}
+
+function renderCycles(cycles) {
+  if (!cycles || !cycles.length) { $("cycles").innerHTML = `<div class="empty">No cycles yet</div>`; return; }
+  $("cycles").innerHTML = `<table><thead><tr><th>Started</th><th>Mode</th>
+    <th class="num">Markets</th><th class="num">New preds</th><th class="num">Bets</th><th>Status</th></tr></thead><tbody>` +
+    cycles.map(c => `<tr>
+      <td class="small">${fmtTs(c.started_at)}</td>
+      <td class="small">${c.mode}</td>
+      <td class="num">${fmtN(c.markets_considered)}</td>
+      <td class="num">${fmtN(c.predictions_made)}</td>
+      <td class="num">${fmtN(c.bets_placed)}</td>
+      <td class="small">${c.error ? `<span class="down">error: ${c.error.slice(0, 60)}</span>` : c.finished_at ? "<span class='up'>ok</span>" : "<span class='muted'>running…</span>"}</td>
+    </tr>`).join("") + "</tbody></table>";
+}
+
+window.setRange = setRange;
+refresh();
+setInterval(refresh, 60000);
+window.addEventListener("resize", () => DATA && renderChart());
+</script>
+</body>
+</html>

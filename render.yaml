@@ -1,0 +1,49 @@
+services:
+  - type: worker
+    name: betx-engine
+    runtime: python
+    region: oregon
+    plan: starter
+    branch: main
+    buildCommand: pip install -r engine/requirements.txt
+    startCommand: python engine/main.py
+    autoDeploy: true
+    envVars:
+      - fromGroup: betx-shared
+
+  - type: web
+    name: betx-dashboard
+    runtime: python
+    region: oregon
+    plan: starter
+    branch: main
+    buildCommand: pip install -r engine/requirements.txt
+    startCommand: uvicorn dashboard.app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - fromGroup: betx-shared
+
+envVarGroups:
+  - name: betx-shared
+    envVars:
+      - key: BETX_INSTANCE
+        value: betx-live-1
+      - key: BETX_DRY_RUN
+        value: "true"          # flip to "false" to go live
+      - key: BETX_LIVE_ENABLED
+        value: "true"
+      - key: BETX_POLL_INTERVAL_SEC
+        value: "600"
+      - key: BETX_CLOSE_BUFFER_HOURS
+        value: "24"
+      - key: BETX_BANKROLL_MOMENTUM
+        value: "150"
+      - key: BETX_BANKROLL_FUNDAMENTAL
+        value: "150"
+      - key: BETX_ARENA_PREDICTOR
+        value: agent-gemini-3.1-pro
+      - key: BETX_ARENA_REFERENCE_PREDICTORS
+        value: gemini-3.1-pro
+      # secrets (DATABASE_URL, ARENA_DATABASE_URL, KALSHI_API_KEY_ID,
+      # KALSHI_PRIVATE_KEY_B64) are set directly on the group, not committed

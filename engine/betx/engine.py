@@ -89,6 +89,11 @@ class Engine:
                     log.exception("candidate %s failed", cand.ticker)
             if cfg.live_enabled and not cfg.dry_run:
                 sync.sync_all(self.store, self.kalshi, cfg)
+            elif cfg.dry_run:
+                settled = sync.settle_dry_run(self.store, self.kalshi, cfg)
+                if settled:
+                    log.info("settled %d dry-run orders from real market outcomes", settled)
+                sync.snapshot_sim_equity(self.store, cfg)
             self.store.finish_cycle(cycle_id, **stats)
         except Exception as e:
             log.exception("cycle failed")

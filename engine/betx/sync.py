@@ -218,3 +218,86 @@ def sync_all(store: Store, kalshi: KalshiClient, cfg: Config) -> None:
     except KalshiError as e:
         log.warning("settlements sync failed: %s", e)
     snapshot_account(store, kalshi, cfg)
+
+
+# ------------------------------------------------------------------- dry-run
+
+def settle_dry_run(store: Store, kalshi: KalshiClient, cfg: Config) -> int:
+    """Settle simulated orders from real market outcomes so a multi-day
+    dry-run shows genuine P&L. Binary results only; anything else waits."""
+    rows = store.query(
+        "SELECT DISTINCT ticker FROM {s}.orders WHERE instance = %s AND dry_run = TRUE "
+        "AND settled_at IS NULL AND COALESCE(filled_count, 0) > 0",
+        (cfg.instance_name,),
+    )
+    n = 0
+    for r in rows:
+        try:
+            m = kalshi.market(r["ticker"])
+        except KalshiError:
+            continue
+        result = (m.get("result") or "").lower()
+        if result not in ("yes", "no"):
+            continue
+        orders = store.query(
+            "SELECT id, side, filled_count, avg_fill_price_cents, limit_price_cents, fees_usd "
+            "FROM {s}.orders WHERE instance = %s AND ticker = %s AND dry_run = TRUE AND settled_at IS NULL",
+            (cfg.instance_name, r["ticker"]),
+        )
+        for o in orders:
+            filled = o["filled_count"] or 0
+            px = (o["avg_fill_price_cents"] or o["limit_price_cents"] or 0) / 100.0
+            cost = filled * px
+            fees = o["fees_usd"] or 0.0
+            revenue = filled * 1.0 if result == o["side"] else 0.0
+            store.execute(
+                "UPDATE {s}.orders SET settled_at = now(), settlement_result = %s, "
+                "settlement_revenue_usd = %s, realized_pnl_usd = %s WHERE id = %s",
+                (result, round(revenue, 4), round(revenue - cost - fees, 4), o["id"]),
+            )
+            n += 1
+    return n
+
+
+def snapshot_sim_equity(store: Store, cfg: Config) -> None:
+    """Write a simulated equity snapshot (sum of lane ledgers + holdings
+    marked to the venue bid) so the dashboard equity curve works in dry-run."""
+    total_cash = 0.0
+    total_value = 0.0
+    open_positions = 0
+    marks = {
+        r["ticker"]: r
+        for r in store.query("SELECT ticker, yes_bid, no_bid, last_price FROM {s}.markets")
+    }
+    for lane, starting in cfg.lane_bankrolls.items():
+        ledger = store.lane_ledger(cfg.instance_name, lane, starting, include_dry_run=True)
+        total_cash += ledger["free_cash"] + ledger["reserved"] - ledger["netting"]
+        positions = store.lane_positions_all(cfg.instance_name, lane, include_dry_run=True)
+        pairs = store.query(
+            "SELECT ticker, COALESCE(SUM(filled_count) FILTER (WHERE side='yes'),0) AS y, "
+            "COALESCE(SUM(filled_count) FILTER (WHERE side='no'),0) AS n FROM {s}.orders "
+            "WHERE instance = %s AND strategy = %s AND settled_at IS NULL AND dry_run = TRUE GROUP BY ticker",
+            (cfg.instance_name, lane),
+        )
+        netted = {p["ticker"]: min(int(p["y"]), int(p["n"])) for p in pairs}
+        for ticker, pos in positions.items():
+            if pos == 0 and not netted.get(ticker):
+                continue
+            open_positions += 1
+            m = marks.get(ticker) or {}
+            if pos > 0:
+                mark = (m.get("yes_bid") or m.get("last_price") or 0) / 100.0
+                total_value += pos * mark
+            elif pos < 0:
+                lp = m.get("last_price")
+                mark = (m.get("no_bid") or (100 - lp if lp is not None else 0)) / 100.0
+                total_value += -pos * mark
+            total_value += netted.get(ticker, 0) * 1.0
+    store.snapshot_equity(
+        instance=cfg.instance_name,
+        balance_usd=round(total_cash, 2),
+        portfolio_value_usd=round(total_value, 2),
+        equity_usd=round(total_cash + total_value, 2),
+        open_positions=open_positions,
+        raw={"simulated": True},
+    )

@@ -170,9 +170,6 @@ class Engine:
         epoch = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
         cands = []
         for p in unprocessed:
-            missing = [l for l in cfg.lanes_for(p["model_spec"]) if l.name not in p["decided_lanes"]]
-            if not missing:
-                continue
             cands.append(
                 Candidate(
                     prediction_row_id=p["id"],
@@ -188,24 +185,26 @@ class Engine:
                 )
             )
 
-        # only each predictor's newest forecast per ticker trades; older ones
-        # are audited as superseded
-        newest: dict[tuple[str, str], Candidate] = {}
-        superseded: list[Candidate] = []
+        # Only each predictor's NEWEST forecast per ticker trades. The newest
+        # map is computed over ALL recent predictions — including fully-decided
+        # ones — so a late-committing OLDER forecast can never trade after a
+        # newer one has already been acted on (sooth's stale-fire_ts guard).
+        newest: dict[tuple[str, str], dt.datetime] = {}
         for cand in cands:
             key = (cand.predictor_name, cand.ticker)
-            cur = newest.get(key)
-            if cur is None or cand.predicted_at > cur.predicted_at:
-                if cur is not None:
-                    superseded.append(cur)
-                newest[key] = cand
-            else:
-                superseded.append(cand)
-        for cand in superseded:
-            for lane in cfg.lanes_for(cand.predictor_name):
-                if lane.name not in cand.decided_lanes:
+            if cand.predicted_at > newest.get(key, epoch):
+                newest[key] = cand.predicted_at
+        out: list[Candidate] = []
+        for cand in cands:
+            missing = [l for l in cfg.lanes_for(cand.predictor_name) if l.name not in cand.decided_lanes]
+            if not missing:
+                continue
+            if cand.predicted_at < newest[(cand.predictor_name, cand.ticker)]:
+                for lane in missing:
                     self._save_skip(cycle_id, cand, lane.name, "superseded")
-        return list(newest.values())
+            else:
+                out.append(cand)
+        return out
 
     # ------------------------------------------------------------- candidates
     def _process_candidate(self, cand: Candidate, cycle_id: int) -> int:
@@ -220,11 +219,15 @@ class Engine:
                 self._save_skip(cycle_id, cand, lane.name, "market_not_found")
             return 0
 
-        close_time = _parse_ts(market.get("close_time")) or cand.close_time
+        close_time = _effective_close(market) or cand.close_time
+        cand.close_time = close_time  # orders/snapshots record the effective time
         status = market.get("status", "")
         self._upsert_market(cand, market, close_time)
 
-        # 24h close gate, fail-closed, before the book fetch
+        # 24h RESOLUTION gate, fail-closed, before the book fetch. Uses the
+        # earliest of close_time / expected_expiration_time / occurrence_datetime
+        # — early-close and occurrence markets resolve well before their nominal
+        # close, and "no trading within 24h of resolve" means resolve, not close.
         if close_time is None:
             reason = "no_close_time"
         elif close_time - now <= dt.timedelta(hours=cfg.close_buffer_hours):
@@ -474,3 +477,14 @@ def _parse_ts(v) -> dt.datetime | None:
         return dt.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _effective_close(market: dict) -> dt.datetime | None:
+    """Earliest plausible resolution time: min of close_time,
+    expected_expiration_time, occurrence_datetime (whichever are present)."""
+    times = [
+        _parse_ts(market.get(k))
+        for k in ("close_time", "expected_expiration_time", "occurrence_datetime")
+    ]
+    times = [t for t in times if t is not None]
+    return min(times) if times else None

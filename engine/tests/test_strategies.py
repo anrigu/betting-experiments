@@ -127,6 +127,96 @@ def test_ladders_from_orderbook_fp_dollars():
     assert best_ask(no_asks) == 0.998
 
 
+# ── vectors ported from sooth tests/test_strategy.py (the reference spec) ──
+
+def test_edge_within_spread_plus_fee_skips():
+    # edge 0.01 clears the spread but 1 contract's $0.01 < ceil-fee $0.02 at 0.50
+    d = decide(0.51, [(0.50, 500)], [(0.55, 500)], free_cash=500.0)
+    assert isinstance(d, Skip) and d.reason == "within_spread"
+
+
+def test_no_side_edge_within_fee_skips_and_clearing_trades():
+    # symmetric NO path: p=0.49 -> no_edge 0.01 at NO ask 0.50 -> skip
+    d = decide(0.49, [(0.55, 500)], [(0.50, 500)], free_cash=500.0)
+    assert isinstance(d, Skip) and d.reason == "within_spread"
+    # p=0.47 -> no_edge 0.03 -> 3 NO, $0.09 > fee $0.06 -> trades
+    d2 = decide(0.47, [(0.55, 500)], [(0.50, 500)], free_cash=500.0)
+    assert isinstance(d2, Order) and d2.side == "no" and d2.contracts == 3
+
+
+def test_held_position_edge_in_fee_band_exits_to_flat():
+    # holding 15 YES; edge decays to 0.01 (inside fee band) -> exit all 15
+    d = decide(0.51, [(0.50, 500)], [(0.52, 500)], free_cash=500.0, position=15)
+    assert isinstance(d, Order)
+    assert d.side == "no" and d.contracts == 15 and d.target_position == 0
+
+
+def test_crossed_book_takes_larger_edge():
+    # pathological both-positive book: YES edge 0.15 beats NO edge 0.05
+    d = decide(0.55, [(0.40, 500)], [(0.40, 500)], free_cash=500.0)
+    assert isinstance(d, Order) and d.side == "yes"
+
+
+def test_rebalance_buys_only_the_difference_to_target():
+    d = decide(0.60, [(0.40, 500)], [(0.62, 500)], free_cash=500.0, position=15)
+    assert isinstance(d, Order)
+    assert d.side == "yes" and d.contracts == 5
+    assert d.target_position == 20 and d.position_before == 15
+
+
+def test_rebalance_reduces_to_smaller_target():
+    # holding 15 YES; new edge 0.10 -> target 10 -> buy 5 NO (venue nets down)
+    d = decide(0.55, [(0.45, 500)], [(0.62, 500)], free_cash=500.0, position=15)
+    assert isinstance(d, Order)
+    assert d.side == "no" and d.contracts == 5 and d.target_position == 10
+
+
+def test_flip_flattens_and_establishes_in_one_order():
+    # nominal edge tie (0.10 vs 0.10) resolved by float arithmetic exactly as
+    # in the reference implementation: NO wins, flip 15 YES -> 10 NO in one order
+    d = decide(0.70, [(0.60, 500)], [(0.20, 500)], free_cash=500.0, position=15)
+    assert isinstance(d, Order)
+    assert d.side == "no" and d.contracts == 25 and d.target_position == -10
+
+
+def test_flip_with_subcent_target_flattens_only():
+    # NO edge positive but < 1 cent -> target 0 -> exit the 15 YES only
+    d = decide(0.70, [(0.80, 500)], [(0.295, 500)], free_cash=500.0, position=15)
+    assert isinstance(d, Order)
+    assert d.side == "no" and d.contracts == 15 and d.target_position == 0
+
+
+def test_rebalance_depth_gate_applies_to_full_delta():
+    # flip needs 25 NO but only 20 rest -> skip entirely, position untouched
+    d = decide(0.70, [(0.60, 500)], [(0.20, 20)], free_cash=500.0, position=15)
+    assert isinstance(d, Skip) and d.reason == "thin_book"
+
+
+def test_within_spread_with_position_exits():
+    # no edge either side -> target 0 -> close the whole position
+    d = decide(0.57, [(0.60, 500)], [(0.45, 500)], free_cash=500.0, position=15)
+    assert isinstance(d, Order)
+    assert d.side == "no" and d.contracts == 15 and d.target_position == 0
+
+
+def test_empty_book_one_side():
+    # YES side has the edge but no asks rest there -> no_book
+    d = decide(0.55, [], [(0.62, 500)], free_cash=500.0)
+    assert isinstance(d, Skip) and d.reason == "no_book"
+
+
+def test_depth_sums_same_price_levels():
+    # two levels at the same best price: 8 + 8 >= 15 -> fills
+    d = decide(0.55, [(0.40, 8), (0.40, 8)], [(0.62, 500)], free_cash=500.0)
+    assert isinstance(d, Order) and d.contracts == 15
+
+
+def test_insufficient_cash_boundary():
+    # needs $6.00 + $0.26 fee > $5 -> skip
+    d = decide(0.55, [(0.40, 500)], [(0.62, 500)], free_cash=5.0)
+    assert isinstance(d, Skip) and d.reason == "insufficient_cash"
+
+
 def test_lane_config_parsing(monkeypatch):
     monkeypatch.setenv(
         "BETX_LANES",

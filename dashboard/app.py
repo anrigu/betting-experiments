@@ -123,6 +123,7 @@ def build_payload() -> dict:
                 "lane": lane,
                 "predictor": lane_def.predictor,
                 "strategy": lane_def.strategy,
+                "sizing": lane_def.sizing,
                 "starting_bankroll": starting,
                 "free_cash": ledger["free_cash"],
                 "reserved": ledger["reserved"],

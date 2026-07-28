@@ -69,14 +69,45 @@ def _depth_at_or_below(ladder: Ladder, limit: float) -> int:
     return sum(c for p, c in ladder if p <= limit + _EPS)
 
 
+def sizing_shares(sizing: str, sign: int, p_e: float, q_side: float, q_opp: float | None) -> float:
+    """Portfolio-units stake (1 unit = 100 contracts) for the chosen side under
+    a proper-scoring sizing rule. `q_side` is the ask of the CHOSEN side,
+    `q_opp` the opposite side's best ask (needed for spherical only).
+
+    brier:     p - q                          (the classic rule; ≤ 1)
+    log:       (ln p - ln q) * q              (relative-error weight; ≤ 1/e)
+    spherical: p/|u| - q/|v|  with u=(p, 1-p), v=(q_side, q_opp)
+    """
+    p_side = p_e if sign > 0 else 1.0 - p_e
+    if sizing == "brier":
+        return p_side - q_side
+    if sizing == "log":
+        if p_side <= 0.0 or q_side <= 0.0:
+            return 0.0
+        return (math.log(p_side) - math.log(q_side)) * q_side
+    if sizing == "spherical":
+        if q_opp is None:
+            return 0.0
+        mu = math.hypot(p_e, 1.0 - p_e)
+        mv = math.hypot(q_side, q_opp)
+        return p_side / mu - q_side / mv
+    raise ValueError(f"unknown sizing rule {sizing!r}")
+
+
 def decide(
     p_e: float,
     yes_asks: Ladder | None,
     no_asks: Ladder | None,
     free_cash: float,
     position: int = 0,
+    sizing: str = "brier",
 ) -> Order | Skip:
-    """The momentum (force-to-target) decision. Port of the framework's strategy.decide."""
+    """The momentum (force-to-target) decision. Port of the framework's
+    strategy.decide, with the target size set by a pluggable proper-scoring
+    sizing rule (`sizing`). The side pick and every gate are rule-independent:
+    the fee gate always compares the position's EV (raw edge x contracts)
+    against the venue-exact fee, because the edge IS the per-contract EV
+    regardless of how many contracts the rule wants."""
     best_yes = best_ask(yes_asks)
     best_no = best_ask(no_asks)
     yes_edge = (p_e - best_yes) if best_yes is not None else None
@@ -89,7 +120,12 @@ def decide(
     elif no_edge is not None and no_edge > 0:
         edge, gate_ask, sign = no_edge, best_no, -1
 
-    n = math.floor(edge * 100.0 + _EPS) if sign != 0 else 0
+    if sign != 0:
+        opposite = best_no if sign > 0 else best_yes
+        shares = sizing_shares(sizing, sign, p_e, gate_ask, opposite)
+        n = math.floor(shares * 100.0 + _EPS) if shares > 0 else 0
+    else:
+        n = 0
     clears_fee = (
         sign != 0 and gate_ask is not None and n > 0
         and edge * n > kalshi_fee("", n, gate_ask)
@@ -132,11 +168,12 @@ def decide_fundamental(
     no_asks: Ladder | None,
     free_cash: float,
     position: int = 0,
+    sizing: str = "brier",
 ) -> Order | Skip:
     """The FUNDAMENTAL strategy: open a FRESH position every forecast, never
     netting against existing holdings — exactly `decide` as if flat. The real
     position is still recorded on the audit row (`position_before`)."""
-    result = decide(p_e, yes_asks, no_asks, free_cash, position=0)
+    result = decide(p_e, yes_asks, no_asks, free_cash, position=0, sizing=sizing)
     if isinstance(result, Order):
         result.position_before = position
     return result

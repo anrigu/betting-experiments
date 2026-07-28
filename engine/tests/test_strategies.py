@@ -217,21 +217,65 @@ def test_insufficient_cash_boundary():
     assert isinstance(d, Skip) and d.reason == "insufficient_cash"
 
 
-def test_lane_config_parsing(monkeypatch):
-    monkeypatch.setenv(
-        "BETX_LANES",
-        "gemini:agent-gemini-3.1-pro:fundamental:150, fable-5:agent-claude-fable-5:fundamental:125",
-    )
+def test_lane_config_parsing():
     from betx.config import Config
-    cfg = Config(lanes_spec="gemini:agent-gemini-3.1-pro:fundamental:150,"
-                            "fable-5:agent-claude-fable-5:fundamental:125")
+    cfg = Config(lanes_spec="gemini:agent-gemini-3.1-pro:fundamental:150:brier,"
+                            "fable-5:agent-claude-fable-5:fundamental:125,"
+                            "gemini-log:agent-gemini-3.1-pro:fundamental:150:log")
     lanes = cfg.lanes
-    assert [(l.name, l.predictor, l.strategy, l.bankroll) for l in lanes] == [
-        ("gemini", "agent-gemini-3.1-pro", "fundamental", 150.0),
-        ("fable-5", "agent-claude-fable-5", "fundamental", 125.0),
+    assert [(l.name, l.predictor, l.strategy, l.bankroll, l.sizing) for l in lanes] == [
+        ("gemini", "agent-gemini-3.1-pro", "fundamental", 150.0, "brier"),
+        ("fable-5", "agent-claude-fable-5", "fundamental", 125.0, "brier"),  # 4-field default
+        ("gemini-log", "agent-gemini-3.1-pro", "fundamental", 150.0, "log"),
     ]
     assert cfg.bet_predictors == ["agent-gemini-3.1-pro", "agent-claude-fable-5"]
-    assert [l.name for l in cfg.lanes_for("agent-claude-fable-5")] == ["fable-5"]
+    assert [l.name for l in cfg.lanes_for("agent-gemini-3.1-pro")] == ["gemini", "gemini-log"]
+
+
+# ── sizing rules (log / spherical lanes) ──────────────────────────────────
+
+def test_log_sizing_shrinks_stake_vs_brier():
+    # p=0.5 vs ask 0.30: brier -> 20 contracts; log -> (ln.5-ln.3)*0.3 = 0.1532 -> 15
+    b = decide(0.50, [(0.30, 500)], [(0.75, 500)], free_cash=500.0)
+    l = decide(0.50, [(0.30, 500)], [(0.75, 500)], free_cash=500.0, sizing="log")
+    assert isinstance(b, Order) and b.contracts == 20
+    assert isinstance(l, Order) and l.contracts == 15
+    assert l.side == "yes" and l.edge == b.edge  # same edge, different size
+
+
+def test_log_sizing_crushes_longshot_stakes():
+    # p=0.20 vs ask 0.05: brier 15 contracts; log (ln.2-ln.05)*0.05 = 0.0693 -> 6
+    b = decide(0.20, [(0.05, 500)], [(0.99, 500)], free_cash=500.0)
+    l = decide(0.20, [(0.05, 500)], [(0.99, 500)], free_cash=500.0, sizing="log")
+    assert isinstance(b, Order) and b.contracts == 15
+    assert isinstance(l, Order) and l.contracts == 6
+
+
+def test_log_sizing_no_side():
+    # p=0.47, no_ask=0.50 -> p_side=0.53: (ln.53-ln.50)*0.5 = 0.0291 -> 2 NO
+    d = decide(0.47, [(0.55, 500)], [(0.50, 500)], free_cash=500.0, sizing="log")
+    assert isinstance(d, Order) and d.side == "no" and d.contracts == 2
+
+
+def test_log_sizing_fee_gate_still_applies():
+    # tiny log stake: edge*n must still beat the ceil'd fee
+    # p=0.515 vs 0.50: log shares = (ln.515-ln.50)*.5 = 0.0148 -> n=1;
+    # edge*1 = $0.015 < fee(1, 0.50) = $0.02 -> within_spread
+    d = decide(0.515, [(0.50, 500)], [(0.52, 500)], free_cash=500.0, sizing="log")
+    assert isinstance(d, Skip) and d.reason == "within_spread"
+
+
+def test_spherical_sizing_orders():
+    # p=0.55 vs (0.40, 0.62): u=(.55,.45)/.7106, v=(.40,.62)/.7378
+    # shares = .55/.7106 - .40/.7378 = 0.7740-0.5421 = 0.2318 -> 23 contracts
+    d = decide(0.55, [(0.40, 500)], [(0.62, 500)], free_cash=500.0, sizing="spherical")
+    assert isinstance(d, Order) and d.side == "yes" and d.contracts == 23
+
+
+def test_sizing_default_is_brier():
+    a = decide(0.60, [(0.40, 500)], [(0.62, 500)], free_cash=500.0)
+    b = decide(0.60, [(0.40, 500)], [(0.62, 500)], free_cash=500.0, sizing="brier")
+    assert isinstance(a, Order) and isinstance(b, Order) and a.contracts == b.contracts == 20
 
 
 def test_money_helpers():

@@ -256,7 +256,8 @@ class Engine:
             book = self._books[lane.name]
             position = book.position(cand.ticker)
             result = strategies.DECIDERS[lane.strategy](
-                cand.p_model, yes_asks, no_asks, book.free_cash, position
+                cand.p_model, yes_asks, no_asks, book.free_cash, position,
+                sizing=lane.sizing,
             )
             placed += self._record_and_execute(
                 cycle_id, lane.name, cand, result, book, position, yes_asks, no_asks, snap_id

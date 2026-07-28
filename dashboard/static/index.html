@@ -274,7 +274,7 @@ function render() {
       <div class="lane-head">
         <span class="lane-name">${l.lane}</span>
         <span class="lane-sub">${l.predictor || ""} · ${STRATEGY_DESC[l.strategy] || l.strategy || ""}
-          · bankroll ${fmt$(l.starting_bankroll)}</span>
+          · ${l.sizing || "brier"} sizing · bankroll ${fmt$(l.starting_bankroll)}</span>
       </div>
       <div class="lane-grid">
         ${lv("Market value", fmt$(l.mtm_equity))}

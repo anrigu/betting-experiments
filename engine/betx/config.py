@@ -20,6 +20,7 @@ class Lane:
     predictor: str
     strategy: str          # "fundamental" | "momentum"
     bankroll: float
+    sizing: str = "brier"  # proper-scoring sizing rule: brier | log | spherical
 
 
 def _b(name: str, default: bool) -> bool:
@@ -79,13 +80,15 @@ class Config:
     close_buffer_hours: float = _f("BETX_CLOSE_BUFFER_HOURS", 24.0)
 
     # --- lanes ---
-    # Two agents, one Kalshi account, virtually separated books: each lane is
-    # name:arena_predictor:strategy:bankroll_usd (comma-separated). Attribution
-    # is per-order via the strategy column, which stores the LANE NAME.
+    # Virtual books on one Kalshi account: each lane is
+    # name:arena_predictor:strategy:bankroll_usd[:sizing] (comma-separated;
+    # sizing = brier|log|spherical, default brier). Attribution is per-order
+    # via the strategy column, which stores the LANE NAME.
     lanes_spec: str = os.environ.get(
         "BETX_LANES",
-        "gemini:agent-gemini-3.1-pro:fundamental:150,"
-        "fable-5:agent-claude-fable-5:fundamental:150",
+        "gemini:agent-gemini-3.1-pro:fundamental:150:brier,"
+        "fable-5:agent-claude-fable-5:fundamental:150:brier,"
+        "gemini-log:agent-gemini-3.1-pro:fundamental:150:log",
     )
 
     # --- optional own-schedule predictor mode (unused in arena-loop mode) ---
@@ -101,10 +104,17 @@ class Config:
             part = part.strip()
             if not part:
                 continue
-            name, predictor, strategy, bankroll = part.split(":")
+            fields = part.split(":")
+            if len(fields) == 4:
+                name, predictor, strategy, bankroll = fields
+                sizing = "brier"
+            else:
+                name, predictor, strategy, bankroll, sizing = fields
             if strategy not in ("fundamental", "momentum"):
                 raise RuntimeError(f"unknown lane strategy {strategy!r} in BETX_LANES")
-            out.append(Lane(name.strip(), predictor.strip(), strategy.strip(), float(bankroll)))
+            if sizing not in ("brier", "log", "spherical"):
+                raise RuntimeError(f"unknown lane sizing {sizing!r} in BETX_LANES")
+            out.append(Lane(name.strip(), predictor.strip(), strategy.strip(), float(bankroll), sizing.strip()))
         if len({l.name for l in out}) != len(out):
             raise RuntimeError("duplicate lane names in BETX_LANES")
         return out

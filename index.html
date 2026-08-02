@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Expanded Dataset Collected through [Redacted] Company</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e;
+    --muted: #898781; --grid: #e1e0d9; --ring: rgba(11,11,11,0.10);
+    --pos: #006300; --neg: #d03b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7;
+      --muted: #898781; --grid: #2c2c2a; --ring: rgba(255,255,255,0.10);
+      --pos: #0ca30c; --neg: #e66767;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--page); color: var(--ink);
+         font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 28px 20px 60px; }
+  h1 { font-size: 20px; margin: 0 0 14px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  select { background: var(--surface); color: var(--ink); border: 1px solid var(--ring);
+           border-radius: 8px; padding: 7px 10px; font: inherit; font-size: 13px; margin: 0 0 12px; }
+  .panel { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px;
+           margin: 0 0 16px; position: relative; }
+  .panel-head { display: flex; justify-content: space-between; align-items: baseline;
+                padding: 12px 16px 0; font-size: 13px; color: var(--ink-2); }
+  .panel-head .roi { font-weight: 650; font-size: 14px; }
+  #chart { display: block; width: 100%; height: auto; }
+  #tip { position: absolute; pointer-events: none; display: none; background: var(--surface);
+         border: 1px solid var(--ring); border-radius: 6px; padding: 5px 9px; font-size: 11.5px;
+         color: var(--ink-2); white-space: nowrap; box-shadow: 0 2px 8px rgba(0,0,0,0.25); z-index: 2; }
+  .btn { background: var(--surface); color: var(--ink-2); border: 1px solid var(--ring);
+         border-radius: 8px; padding: 6px 12px; cursor: pointer; font: inherit; font-size: 13px; }
+  .pager { display: flex; gap: 10px; align-items: center; color: var(--ink-2); font-size: 13px; margin: 0 0 10px; flex-wrap: wrap; }
+  .note { color: var(--muted); font-size: 12px; margin-left: auto; }
+  .tablewrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--ring);
+               border-radius: 10px; margin: 6px 0 12px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { padding: 6px 10px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--grid); }
+  thead th { position: sticky; top: 0; background: var(--surface); color: var(--ink-2);
+             font-weight: 600; z-index: 1; }
+  tbody tr:last-child td { border-bottom: none; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .pos { color: var(--pos); } .neg { color: var(--neg); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Expanded Dataset Collected through [Redacted] Company</h1>
+  <select id="modelSel"></select>
+
+  <div class="panel" id="chartPanel">
+    <div class="panel-head mono">
+      <span>ROI over time</span>
+      <span class="roi" id="finalRoi"></span>
+    </div>
+    <svg id="chart" viewBox="0 0 1120 360" preserveAspectRatio="xMidYMid meet"></svg>
+    <div id="tip"></div>
+  </div>
+
+  <div class="pager">
+    <button class="btn" id="prev">‹</button>
+    <span id="pageInfo"></span>
+    <button class="btn" id="next">›</button>
+    <span class="note">Event and market tickers are withheld for confidentiality.</span>
+  </div>
+  <div class="tablewrap"><table id="rows"><thead></thead><tbody></tbody></table></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const NS = "http://www.w3.org/2000/svg";
+const PAGE = 200;
+const state = { slug: null, rows: [], series: [], page: 0, cache: {} };
+
+function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+async function init() {
+  const manifest = await (await fetch("data/manifest.json")).json();
+  $("#modelSel").innerHTML = manifest.models.map(m => `<option value="${m.slug}">${m.label}</option>`).join("");
+  state.slug = manifest.models[0].slug;
+  $("#modelSel").onchange = e => { state.slug = e.target.value; state.page = 0; load(); };
+  $("#prev").onclick = () => { if (state.page > 0) { state.page--; renderTable(); } };
+  $("#next").onclick = () => { if ((state.page + 1) * PAGE < state.rows.length) { state.page++; renderTable(); } };
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => drawChart());
+  load();
+}
+
+async function load() {
+  if (!state.cache[state.slug])
+    state.cache[state.slug] = await (await fetch(`data/final/${state.slug}.json`)).json();
+  const d = state.cache[state.slug];
+  state.rows = d.rows; state.series = d.series; state.roiDisplay = d.roi_display;
+  drawChart();
+  renderTable();
+}
+
+function el(name, attrs, parent) {
+  const e = document.createElementNS(NS, name);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  parent.appendChild(e);
+  return e;
+}
+
+function niceTicks(lo, hi, n) {
+  const span = hi - lo, step0 = span / n, mag = Math.pow(10, Math.floor(Math.log10(step0)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => span / s <= n) || 10 * mag;
+  const t = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) t.push(v);
+  return t;
+}
+
+function drawChart() {
+  const svg = $("#chart");
+  svg.innerHTML = "";
+  const S = state.series;
+  if (!S.length) return;
+
+  const W = 1120, H = 360, L = 70, R = 28, T = 18, B = 26;
+  const pos = css("--pos"), neg = css("--neg"), muted = css("--muted"), grid = css("--grid");
+
+  const xs = S.map(p => p[0]), ys = S.map(p => p[1]);
+  const x0 = xs[0], x1 = xs[xs.length - 1];
+  let yLo = Math.min(0, ...ys), yHi = Math.max(0, ...ys);
+  const pad = (yHi - yLo) * 0.10 || 5;
+  yLo -= pad; yHi += pad;
+  const X = d => x1 === x0 ? (L + (W - L - R) / 2) : L + (d - x0) / (x1 - x0) * (W - L - R);
+  const Y = v => T + (yHi - v) / (yHi - yLo) * (H - T - B);
+  const y0 = Y(0);
+
+  // grid + y ticks
+  for (const v of niceTicks(yLo, yHi, 5)) {
+    el("line", { x1: L, x2: W - R, y1: Y(v), y2: Y(v), stroke: grid, "stroke-width": 1 }, svg);
+    el("text", { x: L - 8, y: Y(v) + 3.5, "text-anchor": "end", fill: muted, "font-size": 11,
+                 "font-family": "ui-monospace, Menlo, monospace" }, svg)
+      .textContent = (v > 0 ? "+" : "") + Math.round(v) + "%";
+  }
+  const yl = el("text", { x: 16, y: T + (H - T - B) / 2, fill: muted, "font-size": 12,
+               "font-family": "ui-monospace, Menlo, monospace",
+               transform: `rotate(-90 16 ${T + (H - T - B) / 2})`, "text-anchor": "middle" }, svg);
+  yl.textContent = "ROI (%)";
+
+  // zero reference
+  el("line", { x1: L, x2: W - R, y1: y0, y2: y0, stroke: muted, "stroke-width": 1,
+               "stroke-dasharray": "5 5", opacity: 0.7 }, svg);
+
+  const defs = el("defs", {}, svg);
+  const gUp = el("linearGradient", { id: "gUp", gradientUnits: "userSpaceOnUse",
+                                     x1: 0, y1: T, x2: 0, y2: y0 }, defs);
+  el("stop", { offset: "0%", "stop-color": pos, "stop-opacity": 0.22 }, gUp);
+  el("stop", { offset: "100%", "stop-color": pos, "stop-opacity": 0.02 }, gUp);
+  const gDn = el("linearGradient", { id: "gDn", gradientUnits: "userSpaceOnUse",
+                                     x1: 0, y1: H - B, x2: 0, y2: y0 }, defs);
+  el("stop", { offset: "0%", "stop-color": neg, "stop-opacity": 0.22 }, gDn);
+  el("stop", { offset: "100%", "stop-color": neg, "stop-opacity": 0.02 }, gDn);
+  const cUp = el("clipPath", { id: "cUp" }, defs);
+  el("rect", { x: 0, y: 0, width: W, height: y0 }, cUp);
+  const cDn = el("clipPath", { id: "cDn" }, defs);
+  el("rect", { x: 0, y: y0, width: W, height: H - y0 }, cDn);
+
+  const linePath = S.map((p, i) => (i ? "L" : "M") + X(p[0]).toFixed(2) + " " + Y(p[1]).toFixed(2)).join("");
+  const areaPath = linePath + `L${X(x1).toFixed(2)} ${y0.toFixed(2)}L${X(x0).toFixed(2)} ${y0.toFixed(2)}Z`;
+
+  el("path", { d: areaPath, fill: "url(#gUp)", "clip-path": "url(#cUp)" }, svg);
+  el("path", { d: areaPath, fill: "url(#gDn)", "clip-path": "url(#cDn)" }, svg);
+  el("path", { d: linePath, fill: "none", stroke: pos, "stroke-width": 2,
+               "clip-path": "url(#cUp)", "stroke-linejoin": "round" }, svg);
+  el("path", { d: linePath, fill: "none", stroke: neg, "stroke-width": 2,
+               "clip-path": "url(#cDn)", "stroke-linejoin": "round" }, svg);
+
+  // terminal dot
+  const last = S[S.length - 1];
+  el("circle", { cx: X(last[0]), cy: Y(last[1]), r: 5, fill: last[1] >= 0 ? pos : neg,
+                 stroke: css("--surface"), "stroke-width": 2 }, svg);
+
+  const fr = $("#finalRoi");
+  fr.textContent = state.roiDisplay || ((last[1] >= 0 ? "+" : "") + last[1].toFixed(1) + "%");
+  fr.className = "roi " + (last[1] >= 0 ? "pos" : "neg");
+
+  // hover
+  const cross = el("line", { y1: T, y2: H - B, stroke: muted, "stroke-width": 1,
+                             "stroke-dasharray": "3 3", visibility: "hidden" }, svg);
+  const dot = el("circle", { r: 4, fill: "none", "stroke-width": 2, visibility: "hidden" }, svg);
+  const overlay = el("rect", { x: L, y: T, width: W - L - R, height: H - T - B,
+                               fill: "transparent" }, svg);
+  const tip = $("#tip");
+  overlay.addEventListener("mousemove", ev => {
+    const box = svg.getBoundingClientRect();
+    const mx = (ev.clientX - box.left) * W / box.width;
+    let best = S[0], bd = Infinity;
+    for (const p of S) { const d = Math.abs(X(p[0]) - mx); if (d < bd) { bd = d; best = p; } }
+    const col = best[1] >= 0 ? pos : neg;
+    cross.setAttribute("x1", X(best[0])); cross.setAttribute("x2", X(best[0]));
+    cross.setAttribute("visibility", "visible");
+    dot.setAttribute("cx", X(best[0])); dot.setAttribute("cy", Y(best[1]));
+    dot.setAttribute("stroke", col); dot.setAttribute("visibility", "visible");
+    tip.style.display = "block";
+    tip.innerHTML = `<span style="color:${col}">ROI ${best[1] >= 0 ? "+" : ""}${best[1].toFixed(2)}%</span>`;
+    const px = X(best[0]) * box.width / W, py = Y(best[1]) * box.height / H;
+    const headH = $("#chartPanel").querySelector(".panel-head").offsetHeight;
+    tip.style.left = Math.min(px + 14, box.width - tip.offsetWidth - 8) + "px";
+    tip.style.top = (headH + py - 34) + "px";
+  });
+  overlay.addEventListener("mouseleave", () => {
+    cross.setAttribute("visibility", "hidden");
+    dot.setAttribute("visibility", "hidden");
+    tip.style.display = "none";
+  });
+}
+
+function shares(p, qy, qn) {
+  // mirrors the Brier rule exactly: YES stake p-q_yes, else NO stake (1-p)-q_no
+  if (p == null || qy == null || qn == null || !isFinite(qy) || !isFinite(qn)) return null;
+  if (qy <= 0 || qn <= 0) return null;
+  if (1 - qn <= p && p <= qy) return null;
+  if (p > qy) return p - qy;
+  const w = (1 - p) - qn;
+  return w > 0 ? w : null;
+}
+
+function renderTable() {
+  const heads = ["model", "model_prob_yes", "yes_ask¢", "no_ask¢", "outcome", "platform", "shares (p−q)", "pnl"];
+  $("#rows thead").innerHTML = "<tr>" + heads.map((h, i) =>
+    `<th class="${[1,2,3,4,6,7].includes(i) ? "num" : ""}">${h}</th>`).join("") + "</tr>";
+  const start = state.page * PAGE;
+  const dash = `<td class="num" style="color:var(--muted)">—</td>`;
+  const num = (v, dp) => v == null ? dash : `<td class="num">${Number(v).toFixed(dp)}</td>`;
+  $("#rows tbody").innerHTML = state.rows.slice(start, start + PAGE).map(r => {
+    const out = r[5] == null ? null : Number(r[5]);
+    const pnl = r[7];
+    const w = shares(r[2], r[3] == null ? null : r[3] / 100, r[4] == null ? null : r[4] / 100);
+    const wCell = w == null ? `<td class="num" style="color:var(--muted)">no bid (within spread)</td>`
+      : `<td class="num">${w.toFixed(3)}</td>`;
+    const pnlCell = pnl == null ? dash
+      : `<td class="num ${pnl >= 0 ? "pos" : "neg"}">${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)}</td>`;
+    const outCell = out == null ? dash
+      : `<td class="num ${out === 1 ? "pos" : "neg"}">${out === 1 ? "YES" : "NO"}</td>`;
+    return `<tr><td>${r[0]}</td>` +
+      num(r[2], 3) + num(r[3], 1) + num(r[4], 1) +
+      outCell + `<td>${r[6]}</td>${wCell}${pnlCell}</tr>`;
+  }).join("");
+  $("#pageInfo").textContent = `${state.page + 1}/${Math.ceil(state.rows.length / PAGE)}`;
+}
+
+init();
+</script>
+</body>
+</html>

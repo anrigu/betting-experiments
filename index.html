@@ -220,9 +220,9 @@ function shares(p, qy, qn) {
   if (p == null || qy == null || qn == null || !isFinite(qy) || !isFinite(qn)) return null;
   if (qy <= 0 || qn <= 0) return null;
   if (1 - qn <= p && p <= qy) return null;
-  if (p > qy) return p - qy;
+  if (p > qy) return { w: p - qy, side: "YES" };
   const w = (1 - p) - qn;
-  return w > 0 ? w : null;
+  return w > 0 ? { w, side: "NO" } : null;
 }
 
 function renderTable() {
@@ -237,7 +237,7 @@ function renderTable() {
     const pnl = r[7];
     const w = shares(r[2], r[3] == null ? null : r[3] / 100, r[4] == null ? null : r[4] / 100);
     const wCell = w == null ? `<td class="num" style="color:var(--muted)">no bid (within spread)</td>`
-      : `<td class="num">${w.toFixed(3)}</td>`;
+      : `<td class="num">${w.w.toFixed(3)} <span class="${w.side === "YES" ? "pos" : "neg"}">${w.side}</span></td>`;
     const pnlCell = pnl == null ? dash
       : `<td class="num ${pnl >= 0 ? "pos" : "neg"}">${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)}</td>`;
     const outCell = out == null ? dash

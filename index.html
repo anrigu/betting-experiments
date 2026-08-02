@@ -212,7 +212,7 @@ function drawChart() {
     dot.setAttribute("cx", X(best[0])); dot.setAttribute("cy", Y(best[1]));
     dot.setAttribute("stroke", col); dot.setAttribute("visibility", "visible");
     tip.style.display = "block";
-    tip.innerHTML = `<span style="color:${col}">ROI ${best[1] >= 0 ? "+" : ""}${best[1].toFixed(2)}%</span>`;
+    tip.innerHTML = `<span style="color:${col}">ROI ${best[1] >= 0 ? "+" : ""}${best[1].toFixed(1)}%</span>`;
     const px = X(best[0]) * box.width / W, py = Y(best[1]) * box.height / H;
     const headH = $("#chartPanel").querySelector(".panel-head").offsetHeight;
     tip.style.left = Math.min(px + 14, box.width - tip.offsetWidth - 8) + "px";

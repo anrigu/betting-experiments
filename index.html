@@ -245,8 +245,10 @@ function renderTable() {
   $("#rows tbody").innerHTML = state.rows.slice(start, start + PAGE).map(r => {
     const out = r[5] == null ? null : Number(r[5]);
     const pnl = r[7];
+    const noQuote = r[3] == null || r[4] == null;
     const w = shares(r[2], r[3] == null ? null : r[3] / 100, r[4] == null ? null : r[4] / 100);
-    const wCell = w == null ? `<td class="num" style="color:var(--muted)">no bid (within spread)</td>`
+    const wCell = w == null
+      ? `<td class="num" style="color:var(--muted)">${noQuote ? "no market quote" : "no bid (within spread)"}</td>`
       : `<td class="num">${w.w.toFixed(3)} <span class="${w.side === "YES" ? "pos" : "neg"}">${w.side}</span></td>`;
     const pnlCell = pnl == null ? dash
       : `<td class="num ${pnl >= 0 ? "pos" : "neg"}">${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)}</td>`;

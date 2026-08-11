@@ -210,22 +210,32 @@ def process_ticker(
         conn.commit()
         return ticker, len(rows)
     except Exception as e:
-        conn.rollback()
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""INSERT INTO {schema}.candles_backfill_state
-                        (ticker, series, window_start, window_end, status, error, updated_at)
-                    VALUES (%s, %s, %s, %s, 'error', %s, now())
-                    ON CONFLICT (ticker) DO UPDATE SET
-                        -- a failed extension must not demote a completed ticker:
-                        -- its candles up to window_end are already stored
-                        status = CASE WHEN candles_backfill_state.status = 'done'
-                                      THEN 'done' ELSE 'error' END,
-                        error = EXCLUDED.error, updated_at = now()""",
-                (ticker, series, start, end, str(e)[:500]),
-            )
-        conn.commit()
         log.warning("FAILED %s: %s", ticker, e)
+        # Best-effort error record. If the connection itself died (pooler
+        # drop), rebuild it for the next ticker instead of crashing the pool.
+        try:
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""INSERT INTO {schema}.candles_backfill_state
+                            (ticker, series, window_start, window_end, status, error, updated_at)
+                        VALUES (%s, %s, %s, %s, 'error', %s, now())
+                        ON CONFLICT (ticker) DO UPDATE SET
+                            -- a failed extension must not demote a completed ticker:
+                            -- its candles up to window_end are already stored
+                            status = CASE WHEN candles_backfill_state.status = 'done'
+                                          THEN 'done' ELSE 'error' END,
+                            error = EXCLUDED.error, updated_at = now()""",
+                    (ticker, series, start, end, str(e)[:500]),
+                )
+            conn.commit()
+        except Exception:
+            log.exception("state write failed for %s; recycling connection", ticker)
+            try:
+                conn.close()
+            except Exception:
+                pass
+            del local.conn
         return ticker, -1
 
 
@@ -280,7 +290,12 @@ def main() -> int:
             for t in tasks
         ]
         for f in as_completed(futures):
-            ticker, n = f.result()
+            try:
+                ticker, n = f.result()
+            except Exception:
+                log.exception("worker crashed; ticker skipped this run")
+                failed += 1
+                continue
             if n < 0:
                 failed += 1
             else:
@@ -290,7 +305,9 @@ def main() -> int:
                 log.info("progress %d/%d tickers, %d candles, %d failed", done + failed, len(tasks), total_candles, failed)
 
     log.info("finished: %d ok, %d failed, %d candles inserted", done, failed, total_candles)
-    return 1 if failed else 0
+    # Per-ticker failures are recorded in candles_backfill_state and retried on
+    # the next run; a completed sweep is success from the job runner's view.
+    return 0
 
 
 if __name__ == "__main__":

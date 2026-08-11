@@ -138,33 +138,59 @@ def make_client() -> KalshiClient:
     return KalshiClient(base_url=base, public_base_url=base)
 
 
-def fetch_candles(
+def fetch_chunk(
     kalshi: KalshiClient, limiter: RateLimiter, series: str, ticker: str, start_ts: int, end_ts: int
 ) -> list[dict]:
     signed = kalshi._key is not None
+    path = f"/series/{series}/markets/{ticker}/candlesticks"
+    params = {"start_ts": start_ts, "end_ts": end_ts, "period_interval": 1}
+    last: Exception | None = None
+    for attempt in range(3):  # outer retries on top of the client's own
+        limiter.wait()
+        try:
+            resp = kalshi.get(path, **params) if signed else kalshi.get_public(path, **params)
+            return resp.get("candlesticks", [])
+        except KalshiError as e:
+            if e.status not in (429,) and e.status < 500:
+                raise  # 404 etc: deterministic, don't retry
+            last = e
+            time.sleep(10.0 * (attempt + 1))
+    raise RuntimeError(f"gave up on {ticker} [{start_ts}..{end_ts}]: {last}")
+
+
+def fetch_candles(
+    kalshi: KalshiClient, limiter: RateLimiter, series: str, ticker: str, start_ts: int, end_ts: int
+) -> list[dict]:
     out: list[dict] = []
     chunk = start_ts
     while chunk < end_ts:
         chunk_end = min(chunk + CHUNK_MINUTES * 60, end_ts)
-        path = f"/series/{series}/markets/{ticker}/candlesticks"
-        params = {"start_ts": chunk, "end_ts": chunk_end, "period_interval": 1}
-        last: Exception | None = None
-        for attempt in range(3):  # outer retries on top of the client's own
-            limiter.wait()
-            try:
-                resp = kalshi.get(path, **params) if signed else kalshi.get_public(path, **params)
-                out.extend(resp.get("candlesticks", []))
-                last = None
-                break
-            except KalshiError as e:
-                if e.status not in (429,) and e.status < 500:
-                    raise  # 404 etc: deterministic, don't retry
-                last = e
-                time.sleep(10.0 * (attempt + 1))
-        if last is not None:
-            raise RuntimeError(f"gave up on {ticker} [{chunk}..{chunk_end}]: {last}")
+        out.extend(fetch_chunk(kalshi, limiter, series, ticker, chunk, chunk_end))
         chunk = chunk_end
     return out
+
+
+def fetch_back_to_activity(
+    kalshi: KalshiClient,
+    limiter: RateLimiter,
+    series: str,
+    ticker: str,
+    before_ts: int,
+    floor_ts: int,
+) -> list[dict]:
+    """Walk backwards from `before_ts` one chunk at a time until a chunk with
+    candles is found (the market's standing quote for carry-forward pricing),
+    the market open (`floor_ts`) is reached, or the cap runs out."""
+    end = before_ts
+    for _ in range(30):  # cap: ~100 days of walk-back
+        if end <= floor_ts:
+            return []
+        start = max(end - CHUNK_MINUTES * 60, floor_ts)
+        candles = fetch_chunk(kalshi, limiter, series, ticker, start, end)
+        if candles:
+            return candles
+        end = start
+    return []
 
 
 def process_ticker(
@@ -239,6 +265,75 @@ def process_ticker(
         return ticker, -1
 
 
+GAP_UNIVERSE = """
+WITH per AS (
+    SELECT p.ticker, max(p.event_ticker) AS event_ticker,
+           min(p.created_at) AS first_pred, min(c.period_ts) AS first_candle
+    FROM {s}.predictions p LEFT JOIN {s}.candles_1m c USING (ticker)
+    GROUP BY 1)
+SELECT ticker, event_ticker, first_pred, first_candle
+FROM per
+WHERE (first_candle IS NULL OR first_candle > first_pred)
+  -- delisted markets (404s) can never be fetched; don't retry them here
+  AND ticker NOT IN (SELECT ticker FROM {s}.candles_backfill_state WHERE status = 'error')
+ORDER BY ticker
+"""
+
+
+def process_gap_ticker(
+    schema: str,
+    database_url: str,
+    kalshi: KalshiClient,
+    limiter: RateLimiter,
+    local: threading.local,
+    task: dict,
+) -> tuple[str, int]:
+    """Fetch the standing quote history for a ticker whose predictions predate
+    its earliest stored candle: walk back from that boundary to the market's
+    last prior activity."""
+    if not hasattr(local, "conn"):
+        local.conn = psycopg.connect(database_url, connect_timeout=30)
+    conn: psycopg.Connection = local.conn
+    ticker = task["ticker"]
+    series = task["event_ticker"].split("-")[0]
+    boundary = min(
+        [t for t in (task["first_candle"], task["first_pred"] + dt.timedelta(minutes=1)) if t is not None]
+    )
+    try:
+        limiter.wait()
+        market = kalshi.market(ticker)
+        open_time = market.get("open_time")
+        floor_ts = (
+            int(dt.datetime.fromisoformat(open_time.replace("Z", "+00:00")).timestamp())
+            if open_time else int(boundary.timestamp()) - 100 * 86400
+        )
+        candles = fetch_back_to_activity(
+            kalshi, limiter, series, ticker, int(boundary.timestamp()), floor_ts
+        )
+        rows = [candle_row(ticker, c) for c in candles]
+        with conn.cursor() as cur:
+            if rows:
+                cur.executemany(INSERT.format(s=schema), rows)
+            cur.execute(
+                f"""UPDATE {schema}.candles_backfill_state
+                    SET candles = candles + %s, updated_at = now() WHERE ticker = %s""",
+                (len(rows), ticker),
+            )
+        conn.commit()
+        return ticker, len(rows)
+    except Exception as e:
+        log.warning("GAP-FILL FAILED %s: %s", ticker, e)
+        try:
+            conn.rollback()
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            del local.conn
+        return ticker, -1
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -247,6 +342,8 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--rps", type=float, default=8.0, help="global request rate cap")
     ap.add_argument("--buffer-minutes", type=int, default=1440, help="candle history before first prediction")
+    ap.add_argument("--gap-fill", action="store_true",
+                    help="fetch pre-window standing quotes for tickers whose predictions predate their first candle")
     args = ap.parse_args()
 
     load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
@@ -256,12 +353,41 @@ def main() -> int:
     with psycopg.connect(database_url, connect_timeout=30) as conn:
         with conn.cursor() as cur:
             cur.execute(DDL.format(s=schema))
-            cur.execute(UNIVERSE.format(s=schema))
+            cur.execute((GAP_UNIVERSE if args.gap_fill else UNIVERSE).format(s=schema))
             cols = [d.name for d in cur.description]
             universe = [dict(zip(cols, r)) for r in cur.fetchall()]
             cur.execute(f"SELECT ticker, window_end, status FROM {schema}.candles_backfill_state")
             state = {t: (we, st) for t, we, st in cur.fetchall()}
         conn.commit()
+
+    if args.gap_fill:
+        tasks = universe[: args.limit] if args.limit else universe
+        log.info("gap-fill: %d tickers with predictions before their first candle", len(tasks))
+        kalshi = make_client()
+        limiter = RateLimiter(1.0 / args.rps)
+        local = threading.local()
+        done = failed = total_candles = 0
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = [
+                pool.submit(process_gap_ticker, schema, database_url, kalshi, limiter, local, t)
+                for t in tasks
+            ]
+            for f in as_completed(futures):
+                try:
+                    ticker, n = f.result()
+                except Exception:
+                    log.exception("gap-fill worker crashed; ticker skipped this run")
+                    failed += 1
+                    continue
+                if n < 0:
+                    failed += 1
+                else:
+                    done += 1
+                    total_candles += n
+                if (done + failed) % 200 == 0:
+                    log.info("gap-fill progress %d/%d, %d candles, %d failed", done + failed, len(tasks), total_candles, failed)
+        log.info("gap-fill finished: %d ok, %d failed, %d candles inserted", done, failed, total_candles)
+        return 0
 
     now = dt.datetime.now(dt.timezone.utc)
     tasks = []

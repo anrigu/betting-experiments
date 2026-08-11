@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import logging
 import os
@@ -27,13 +28,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal
 
-import httpx
 import psycopg
 from dotenv import load_dotenv
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "engine"))
+from betx.kalshi import KalshiClient, KalshiError  # noqa: E402
+
 log = logging.getLogger("backfill_candles")
 
-API = "https://api.elections.kalshi.com/trade-api/v2"
 CHUNK_MINUTES = 4900          # API caps a request at 5000 candles
 RESUME_OVERLAP_S = 3600       # re-fetch the last hour when extending a ticker
 
@@ -122,27 +124,45 @@ def candle_row(ticker: str, c: dict) -> tuple:
     )
 
 
+def make_client() -> KalshiClient:
+    """Signed client when credentials are configured (account-scoped rate
+    limits — needed from datacenter IPs, which Kalshi throttles hard);
+    unauthenticated public client otherwise."""
+    base = os.environ.get("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
+    key_id = os.environ.get("KALSHI_API_KEY_ID", "")
+    key_b64 = os.environ.get("KALSHI_PRIVATE_KEY_B64", "")
+    if key_id and key_b64:
+        log.info("using signed Kalshi requests (key %s...)", key_id[:8])
+        return KalshiClient(base_url=base, api_key_id=key_id, private_key_pem=base64.b64decode(key_b64))
+    log.info("no Kalshi credentials; using unauthenticated requests")
+    return KalshiClient(base_url=base, public_base_url=base)
+
+
 def fetch_candles(
-    http: httpx.Client, limiter: RateLimiter, series: str, ticker: str, start_ts: int, end_ts: int
+    kalshi: KalshiClient, limiter: RateLimiter, series: str, ticker: str, start_ts: int, end_ts: int
 ) -> list[dict]:
+    signed = kalshi._key is not None
     out: list[dict] = []
     chunk = start_ts
     while chunk < end_ts:
         chunk_end = min(chunk + CHUNK_MINUTES * 60, end_ts)
-        for attempt in range(4):
+        path = f"/series/{series}/markets/{ticker}/candlesticks"
+        params = {"start_ts": chunk, "end_ts": chunk_end, "period_interval": 1}
+        last: Exception | None = None
+        for attempt in range(3):  # outer retries on top of the client's own
             limiter.wait()
-            r = http.get(
-                f"{API}/series/{series}/markets/{ticker}/candlesticks",
-                params={"start_ts": chunk, "end_ts": chunk_end, "period_interval": 1},
-            )
-            if r.status_code == 429 or r.status_code >= 500:
-                time.sleep(2.0 * (attempt + 1))
-                continue
-            r.raise_for_status()
-            out.extend(r.json().get("candlesticks", []))
-            break
-        else:
-            raise RuntimeError(f"gave up after retries on {ticker} [{chunk}..{chunk_end}]")
+            try:
+                resp = kalshi.get(path, **params) if signed else kalshi.get_public(path, **params)
+                out.extend(resp.get("candlesticks", []))
+                last = None
+                break
+            except KalshiError as e:
+                if e.status not in (429,) and e.status < 500:
+                    raise  # 404 etc: deterministic, don't retry
+                last = e
+                time.sleep(10.0 * (attempt + 1))
+        if last is not None:
+            raise RuntimeError(f"gave up on {ticker} [{chunk}..{chunk_end}]: {last}")
         chunk = chunk_end
     return out
 
@@ -150,6 +170,7 @@ def fetch_candles(
 def process_ticker(
     schema: str,
     database_url: str,
+    kalshi: KalshiClient,
     limiter: RateLimiter,
     local: threading.local,
     task: dict,
@@ -157,7 +178,6 @@ def process_ticker(
 ) -> tuple[str, int]:
     if not hasattr(local, "conn"):
         local.conn = psycopg.connect(database_url, connect_timeout=30)
-        local.http = httpx.Client(timeout=30.0)
     conn: psycopg.Connection = local.conn
 
     ticker = task["ticker"]
@@ -172,7 +192,7 @@ def process_ticker(
         return ticker, 0
 
     try:
-        candles = fetch_candles(local.http, limiter, series, ticker, int(start.timestamp()), int(end.timestamp()))
+        candles = fetch_candles(kalshi, limiter, series, ticker, int(start.timestamp()), int(end.timestamp()))
         rows = [candle_row(ticker, c) for c in candles]
         with conn.cursor() as cur:
             if rows:
@@ -197,7 +217,11 @@ def process_ticker(
                         (ticker, series, window_start, window_end, status, error, updated_at)
                     VALUES (%s, %s, %s, %s, 'error', %s, now())
                     ON CONFLICT (ticker) DO UPDATE SET
-                        status = 'error', error = EXCLUDED.error, updated_at = now()""",
+                        -- a failed extension must not demote a completed ticker:
+                        -- its candles up to window_end are already stored
+                        status = CASE WHEN candles_backfill_state.status = 'done'
+                                      THEN 'done' ELSE 'error' END,
+                        error = EXCLUDED.error, updated_at = now()""",
                 (ticker, series, start, end, str(e)[:500]),
             )
         conn.commit()
@@ -239,18 +263,20 @@ def main() -> int:
                 continue
             t["prior_end"] = prior_end
         tasks.append(t)
+    complete = len(universe) - len(tasks)
     if args.limit:
         tasks = tasks[: args.limit]
-    log.info("universe=%d already-complete=%d to-fetch=%d", len(universe), len(universe) - len(tasks), len(tasks))
+    log.info("universe=%d already-complete=%d to-fetch=%d", len(universe), complete, len(tasks))
     if not tasks:
         return 0
 
+    kalshi = make_client()
     limiter = RateLimiter(1.0 / args.rps)
     local = threading.local()
     done = failed = total_candles = 0
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = [
-            pool.submit(process_ticker, schema, database_url, limiter, local, t, args.buffer_minutes)
+            pool.submit(process_ticker, schema, database_url, kalshi, limiter, local, t, args.buffer_minutes)
             for t in tasks
         ]
         for f in as_completed(futures):

@@ -68,6 +68,22 @@ dashboard/        FastAPI + self-contained page (uvicorn dashboard.app:app)
 render.yaml       Render blueprint (worker + dashboard)
 ```
 
+## Deploying
+
+Render's autoDeploy does **not** reliably fire for this repo, so a push can
+leave services running old code. After pushing, trigger the deploy explicitly
+and confirm it reaches `live` — `RENDER_API_KEY` is in `.env`:
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $RENDER_API_KEY" \
+  -H "Content-Type: application/json" -d '{"clearCache":"do_not_clear"}' \
+  https://api.render.com/v1/services/<service-id>/deploys
+```
+
+Note also that there is no Render Blueprint for this repo: `render.yaml`
+documents the intended topology, but services were created individually, so
+adding a service to it does not create anything.
+
 ## Safety switches
 
 | env | meaning |

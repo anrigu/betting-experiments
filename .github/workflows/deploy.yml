@@ -1,0 +1,63 @@
+# Render's GitHub App is not connected for this repo, so pushes do not
+# trigger deploys on their own — services silently keep running old code.
+# This closes that gap by calling Render's REST API directly.
+#
+# Only runs on push to main and manual dispatch: fork pull requests never
+# receive repository secrets, so RENDER_API_KEY cannot leak from a PR.
+name: Deploy to Render
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: render-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [betx-engine, betx-collector, betx-dashboard]
+    steps:
+      - name: Trigger deploy and wait for it to go live
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          SERVICE: ${{ matrix.service }}
+        run: |
+          set -euo pipefail
+          api() { curl -sS -H "Authorization: Bearer $RENDER_API_KEY" \
+                       -H "Accept: application/json" "$@"; }
+
+          # Look the service up by name so the workflow survives a service
+          # being recreated with a new id.
+          SID=$(api "https://api.render.com/v1/services?name=$SERVICE&limit=20" \
+                | jq -r --arg n "$SERVICE" '[.[].service | select(.name==$n)][0].id')
+          if [ -z "$SID" ] || [ "$SID" = "null" ]; then
+            echo "::error::no Render service named $SERVICE"; exit 1
+          fi
+          echo "$SERVICE -> $SID"
+
+          DEP=$(api -X POST -H "Content-Type: application/json" \
+                    -d '{"clearCache":"do_not_clear"}' \
+                    "https://api.render.com/v1/services/$SID/deploys" | jq -r '.id')
+          echo "deploy $DEP triggered"
+
+          # Poll to completion so a broken build fails the workflow loudly
+          # instead of leaving a service half-updated and unnoticed.
+          for i in $(seq 1 80); do
+            ST=$(api "https://api.render.com/v1/services/$SID/deploys/$DEP" \
+                 | jq -r '.status // .deploy.status')
+            echo "  [$i] $ST"
+            case "$ST" in
+              live)
+                echo "::notice::$SERVICE deployed ($DEP)"; exit 0 ;;
+              build_failed|update_failed|canceled|pre_deploy_failed)
+                echo "::error::$SERVICE deploy $ST ($DEP)"; exit 1 ;;
+            esac
+            sleep 15
+          done
+          echo "::error::$SERVICE deploy timed out after 20m"; exit 1

@@ -75,7 +75,7 @@ class Config:
     # BETX_POLL_INTERVAL_SEC is the TRADING loop and stays separate on
     # purpose: collection cadence must be tunable without changing when the
     # engine decides trades.
-    collect_interval_sec: int = _i("BETX_COLLECT_INTERVAL_SEC", 300)
+    collect_interval_sec: int = _i("BETX_COLLECT_INTERVAL_SEC", 3600)
 
     # --- polymarket collection ---
     # Universe: "arena" = the PM events ProphetArena tracks (default),
@@ -115,7 +115,7 @@ class Config:
     # rather than storing fewer, so EVERY_N controls API calls and FIDELITY
     # controls rows. Hourly (60) instead of per-minute cuts this table 60x;
     # the book snapshots carry the high-resolution record.
-    pm_history_every_n_cycles: int = _i("BETX_PM_HISTORY_EVERY_N", 12)
+    pm_history_every_n_cycles: int = _i("BETX_PM_HISTORY_EVERY_N", 1)
     pm_history_fidelity: int = _i("BETX_PM_HISTORY_FIDELITY", 60)
     pm_history_cold_interval: str = os.environ.get("BETX_PM_HISTORY_COLD_INTERVAL", "max")
 
@@ -160,7 +160,11 @@ class Config:
     # Kalshi tickers emit ~2,900 orderbook deltas in 40s, so books are kept
     # in memory and a snapshot is written only on change and at most once
     # per STREAM_MIN_INTERVAL_SEC per market. Trades are always written.
-    stream_enabled: bool = _b("BETX_STREAM_ENABLED", True)
+    # OFF by default. The feeds are ~1,400 deltas/sec at full scope and even
+    # rate-limited to one snapshot per market per 30s they add ~89 GB/month
+    # of book rows, roughly 5x the polling total. Turn on only when
+    # sub-minute book dynamics are actually the question.
+    stream_enabled: bool = _b("BETX_STREAM_ENABLED", False)
     stream_pm_enabled: bool = _b("BETX_STREAM_PM_ENABLED", True)
     stream_kx_enabled: bool = _b("BETX_STREAM_KX_ENABLED", True)
     stream_min_interval_sec: float = _f("BETX_STREAM_MIN_INTERVAL_SEC", 30.0)

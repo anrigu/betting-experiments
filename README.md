@@ -196,6 +196,11 @@ subscribed:
 | Polymarket | `wss://ws-subscriptions-clob.polymarket.com/ws/market` | none |
 | Kalshi | `wss://api.elections.kalshi.com/trade-api/ws/v2` | the same RSA-PSS headers the REST client builds |
 
+**Built and verified, but not deployed.** Even rate-limited it adds ~89
+GB/month of book rows — roughly 5x the entire polling total — for sub-minute
+book resolution. `BETX_STREAM_ENABLED` defaults to `false` and there is no
+Render worker for it. Turn it on when sub-minute dynamics are the question.
+
 **Not a row per message.** Measured on the live feeds, 400 Kalshi tickers emit
 **2,928 orderbook deltas in 40 seconds** — ~1,400/sec at full scope. So the
 streams hold each book in memory and write a snapshot only when it changed and
@@ -262,39 +267,48 @@ trimmed to pay for it.
 Measured on-disk cost (heap + TOAST + indexes, real rows loaded into Postgres),
 against arena's current PM set of 41 events / 227 markets / 394 live tokens:
 
-| table | bytes/row | rows/day | MB/day |
-|---|---:|---:|---:|
-| `kx_book_snapshots` | 1,553 | 335,232 | 520 |
-| `pm_book_snapshots` | 1,732 | 113,472 | 197 |
-| `pm_market_snapshots` | 544 | 65,376 | 36 |
-| `kx_trades` | 697 | (traffic-dependent) | ~35 |
-| `pm_trades` | 2,167 | ~8,600 | 19 |
-| `pm_price_history` | 671 | 9,456 | 6 |
-| **total** | | | **~812** (~24 GB/month) |
+Per-row costs are measured (real rows loaded into Postgres); row counts follow
+from the **hourly** interval (24 cycles/day):
+
+| table | bytes/row | MB/day |
+|---|---:|---:|
+| `kx_book_snapshots` | 1,553 | ~135 |
+| `pm_book_snapshots` | 1,732 | ~16 |
+| `kx_trades` / `pm_trades` | 697 / 2,167 | ~50 |
+| `pm_market_snapshots` | 544 | ~3 |
+| `pm_price_history` | 671 | ~6 |
+| **total** | | **~210** (~6 GB/month) |
+
+Book row counts at hourly are an estimate: more of each book changes over an
+hour than over five minutes, so the unchanged-book skip rate falls and the
+saving is less than the 12x the interval change suggests. The real figure
+shows up in `collect_cycles.detail` within a day — check
+`books_unchanged_skipped` against `books_returned`.
+
+One-time costs, already paid and not recurring: the first cycle backfills each
+market's trade history and every token's price series — 742 MB across
+`pm_trades`, `kx_trades` and `pm_price_history`.
 
 `kx_markets`, `pm_markets` and `pm_events` are upserted at a fixed row count
-and do not grow. Order books are ~88% of the total, which is the intent. Three
-things bought the headroom: dropping the redundant `raw` payloads (−22% on PM
-book snapshots, −86% on PM market snapshots), hourly rather than per-minute
-price history, and skipping unchanged Kalshi books — 66% of them, measured over
-real 5-minute intervals (70% overall). Without that last one, Kalshi books
-alone would be 100 GB/month.
+and do not grow. Retention is unbounded — nothing is pruned. Four things keep
+that affordable: the hourly interval, dropping the redundant `raw` payloads
+(−22% on PM book snapshots, −86% on PM market snapshots), hourly rather than
+per-minute price history, and skipping unchanged Kalshi books.
 
-A cold start is heavier than steady state: the first cycle backfills each
-market's trade history and every token's price series. Measured end to end,
-cycles ran 188s cold and 92s warm, both inside the 300s interval.
+A cold start is much heavier than steady state. Measured in production: 846s
+for the first cycle (7,896 markets, 7,540 books, 267,755 trades), against 143s
+for a warm Kalshi pass.
 
 Note that **`BETX_PM_HISTORY_EVERY_N` does not reduce stored rows** — the
 series is cumulative, so running it less often just batches more points per
 call. `BETX_PM_HISTORY_FIDELITY` (60 = hourly) is the row-volume knob;
 `EVERY_N` is the API-call knob.
 
-To spend less: raise `BETX_COLLECT_INTERVAL_SEC`, tighten the Kalshi scope
-windows, or set `BETX_PM_SKIP_UNCHANGED_BOOKS=true` (Polymarket publishes a
-book hash, so unchanged books there are exact duplicates too — it is off by
-default only because all ~400 PM tokens are actively traded). To spend more:
-lower the interval, or widen `BETX_KX_FORECAST_WITHIN_DAYS` /
-`BETX_KX_CLOSING_WITHIN_DAYS`.
+`BETX_COLLECT_INTERVAL_SEC` is the dial that matters — book snapshots are
+~85% of the growth and scale with it. Tightening the Kalshi scope saves much
+less than it looks: the markets a narrower window drops are the long-dated
+ones that change ~11% of the time, which the unchanged-book skip already makes
+nearly free.
 
 ## Data
 

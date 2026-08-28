@@ -65,8 +65,112 @@ class Config:
 
     # --- kalshi ---
     kalshi_base_url: str = os.environ.get("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
+    # unauthenticated market-data host (markets/orderbooks/events/trades);
+    # set empty to force everything through the signed host
+    kalshi_public_base_url: str = os.environ.get("KALSHI_PUBLIC_BASE_URL", "https://external-api.kalshi.com")
     kalshi_api_key_id: str = os.environ.get("KALSHI_API_KEY_ID", "")
     kalshi_private_key_b64: str = os.environ.get("KALSHI_PRIVATE_KEY_B64", "")
+
+    # --- collection (read-only; both venues, one worker, one cadence) ---
+    # BETX_POLL_INTERVAL_SEC is the TRADING loop and stays separate on
+    # purpose: collection cadence must be tunable without changing when the
+    # engine decides trades.
+    collect_interval_sec: int = _i("BETX_COLLECT_INTERVAL_SEC", 300)
+
+    # --- polymarket collection ---
+    # Universe: "arena" = the PM events ProphetArena tracks (default),
+    # "all" = every open order-book event on Gamma, "both" = the union.
+    pm_enabled: bool = _b("BETX_PM_ENABLED", True)
+    pm_universe: str = os.environ.get("BETX_PM_UNIVERSE", "arena")
+    pm_include_closed: bool = _b("BETX_PM_INCLUDE_CLOSED", False)
+    pm_extra_slugs: list[str] = field(
+        default_factory=lambda: [
+            s.strip() for s in os.environ.get("BETX_PM_EXTRA_SLUGS", "").split(",") if s.strip()
+        ]
+    )
+    pm_max_events: int = _i("BETX_PM_MAX_EVENTS", 5000)
+    pm_order_book_only: bool = _b("BETX_PM_ORDER_BOOK_ONLY", True)
+    pm_timeout_sec: float = _f("BETX_PM_TIMEOUT_SEC", 30.0)
+    # politeness throttle between HTTP calls; a full cycle is ~1 batched call
+    # per 50 tokens plus one tape call per market
+    pm_min_interval_sec: float = _f("BETX_PM_MIN_INTERVAL_SEC", 0.05)
+    pm_batch_size: int = _i("BETX_PM_BATCH_SIZE", 50)
+
+    # what to capture
+    pm_collect_books: bool = _b("BETX_PM_COLLECT_BOOKS", True)
+    pm_collect_quotes: bool = _b("BETX_PM_COLLECT_QUOTES", True)
+    pm_collect_trades: bool = _b("BETX_PM_COLLECT_TRADES", True)
+    pm_collect_history: bool = _b("BETX_PM_COLLECT_HISTORY", True)
+    pm_collect_predictions: bool = _b("BETX_PM_COLLECT_PREDICTIONS", True)
+    # off by default: an unchanged book is still an observation, and the
+    # venue hash makes the duplicate cheap to filter at read time
+    pm_skip_unchanged_books: bool = _b("BETX_PM_SKIP_UNCHANGED_BOOKS", False)
+
+    # cadences, in collector cycles
+    pm_trades_every_n_cycles: int = _i("BETX_PM_TRADES_EVERY_N", 1)
+    pm_trades_page_size: int = _i("BETX_PM_TRADES_PAGE_SIZE", 500)
+    pm_trades_max_pages: int = _i("BETX_PM_TRADES_MAX_PAGES", 20)        # cold start
+    pm_trades_max_pages_warm: int = _i("BETX_PM_TRADES_MAX_PAGES_WARM", 5)
+    # Price history is cumulative: running it less often batches more points
+    # rather than storing fewer, so EVERY_N controls API calls and FIDELITY
+    # controls rows. Hourly (60) instead of per-minute cuts this table 60x;
+    # the book snapshots carry the high-resolution record.
+    pm_history_every_n_cycles: int = _i("BETX_PM_HISTORY_EVERY_N", 12)
+    pm_history_fidelity: int = _i("BETX_PM_HISTORY_FIDELITY", 60)
+    pm_history_cold_interval: str = os.environ.get("BETX_PM_HISTORY_COLD_INTERVAL", "max")
+
+    # empty = every predictor arena has, not just the betting lanes
+    pm_predictors: list[str] = field(
+        default_factory=lambda: [
+            s.strip() for s in os.environ.get("BETX_PM_PREDICTORS", "").split(",") if s.strip()
+        ]
+    )
+    pm_backfill_hours: float = _f("BETX_PM_BACKFILL_HOURS", 72.0)
+
+    # --- kalshi collection (read-only; same isolation as the pm_* side) ---
+    # Arena tracks ~15k open Kalshi markets; all of them every cycle is
+    # ~173 GB/month of rows. The scope is therefore driven by FORECAST
+    # RECENCY, which is what makes a market interesting, and NOT by close
+    # time: the engine's only close gate is "no bets within 24h of close",
+    # so it will happily trade a market resolving months out. Filtering on
+    # close time silently drops markets the engine acts on, so
+    # BETX_KX_CLOSING_WITHIN_DAYS defaults to 0 (off) and exists only as a
+    # cost lever of last resort. Long-dated books are cheap anyway — they
+    # barely move, so the unchanged-book skip absorbs them.
+    # Either window: 0 or negative disables it.
+    kx_enabled: bool = _b("BETX_KX_ENABLED", True)
+    kx_include_closed: bool = _b("BETX_KX_INCLUDE_CLOSED", False)
+    kx_forecast_within_days: float = _f("BETX_KX_FORECAST_WITHIN_DAYS", 30.0)
+    kx_closing_within_days: float = _f("BETX_KX_CLOSING_WITHIN_DAYS", 0.0)
+    kx_max_markets: int = _i("BETX_KX_MAX_MARKETS", 40000)
+    kx_collect_books: bool = _b("BETX_KX_COLLECT_BOOKS", True)
+    kx_collect_trades: bool = _b("BETX_KX_COLLECT_TRADES", True)
+    # ON by default here, unlike Polymarket: most of these markets never move,
+    # and Kalshi issues no book hash so we compute one. An unchanged book is
+    # byte-identical to the previous row.
+    kx_skip_unchanged_books: bool = _b("BETX_KX_SKIP_UNCHANGED_BOOKS", True)
+    # /markets/trades is one ticker per call, so the sweep is capped; markets
+    # whose volume did not move are skipped before the cap applies.
+    kx_trades_max_markets: int = _i("BETX_KX_TRADES_MAX_MARKETS", 1500)
+    kx_trades_page_size: int = _i("BETX_KX_TRADES_PAGE_SIZE", 100)
+    kx_trades_max_pages: int = _i("BETX_KX_TRADES_MAX_PAGES", 5)
+
+    # --- streaming collection (engine/stream.py, separate worker) ---
+    # Event-driven capture between polls. Measured on the live feeds, 400
+    # Kalshi tickers emit ~2,900 orderbook deltas in 40s, so books are kept
+    # in memory and a snapshot is written only on change and at most once
+    # per STREAM_MIN_INTERVAL_SEC per market. Trades are always written.
+    stream_enabled: bool = _b("BETX_STREAM_ENABLED", True)
+    stream_pm_enabled: bool = _b("BETX_STREAM_PM_ENABLED", True)
+    stream_kx_enabled: bool = _b("BETX_STREAM_KX_ENABLED", True)
+    stream_min_interval_sec: float = _f("BETX_STREAM_MIN_INTERVAL_SEC", 30.0)
+    stream_flush_sec: float = _f("BETX_STREAM_FLUSH_SEC", 10.0)
+    stream_pm_chunk: int = _i("BETX_STREAM_PM_CHUNK", 400)
+    stream_kx_max_tickers: int = _i("BETX_STREAM_KX_MAX_TICKERS", 5000)
+    stream_idle_timeout_sec: float = _f("BETX_STREAM_IDLE_TIMEOUT_SEC", 120.0)
+    # rebuild the universe and reconnect on this cadence, so newly listed
+    # markets get picked up without a restart
+    stream_refresh_sec: float = _f("BETX_STREAM_REFRESH_SEC", 3600.0)
 
     # --- execution ---
     dry_run: bool = _b("BETX_DRY_RUN", False)
@@ -118,6 +222,35 @@ class Config:
         if len({l.name for l in out}) != len(out):
             raise RuntimeError("duplicate lane names in BETX_LANES")
         return out
+
+    def validate_collect(self) -> None:
+        if self.pm_universe not in ("arena", "all", "both"):
+            raise RuntimeError(
+                f"unknown BETX_PM_UNIVERSE {self.pm_universe!r} (arena|all|both)"
+            )
+        if not (self.pm_enabled or self.kx_enabled):
+            raise RuntimeError(
+                "both BETX_PM_ENABLED and BETX_KX_ENABLED are off; nothing to collect"
+            )
+
+    @staticmethod
+    def _window(days: float) -> float | None:
+        """A scope window in days, or None when disabled. Passing 0.0 straight
+        through would mean `close_time < now()`, i.e. exclude everything —
+        the opposite of 'no limit'."""
+        return days if days and days > 0 else None
+
+    @property
+    def kx_forecast_window(self) -> float | None:
+        return self._window(self.kx_forecast_within_days)
+
+    @property
+    def kx_closing_window(self) -> float | None:
+        return self._window(self.kx_closing_within_days)
+
+    @property
+    def collect_venues(self) -> list[str]:
+        return (["polymarket"] if self.pm_enabled else []) + (["kalshi"] if self.kx_enabled else [])
 
     @property
     def bet_predictors(self) -> list[str]:

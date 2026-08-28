@@ -57,7 +57,10 @@ def main() -> None:
 
     store = Store(cfg.database_url, cfg.db_schema)
     store.migrate()
-    kalshi = KalshiClient(cfg.kalshi_base_url, cfg.kalshi_api_key_id, cfg.kalshi_private_key_pem)
+    kalshi = KalshiClient(
+        cfg.kalshi_base_url, cfg.kalshi_api_key_id, cfg.kalshi_private_key_pem,
+        public_base_url=cfg.kalshi_public_base_url,
+    )
     arena = ArenaDB(cfg.arena_database_url)
     engine = Engine(cfg, store, kalshi, arena)
 

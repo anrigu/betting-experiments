@@ -6,12 +6,18 @@ Safety properties (learned from the framework's live run):
     a crash or a concurrent worker costs at most a skipped bet, never a
     double bet; client_order_id is a uuid5 of the same identity for venue-
     level idempotency;
-  * decide off the live book, always — ladders come from the authed
-    orderbook endpoint at decision time, never from arena snapshots;
+  * decide off the live book, always — ladders come from the venue's
+    full-depth orderbook (public market-data API, signed fallback) at
+    decision time, never from arena snapshots;
   * 24h close gate fails closed — no close_time means no bet;
   * orders are limit buys at the ask with a 5-minute venue-side expiration —
     the depth pre-check makes an immediate fill likely and a moved book
     kills the order instead of letting it rest stale.
+
+Data capture: every decision gets a full-depth book snapshot it priced from
+('decision'), and every order submit — live, dry-run, or failed — gets a
+fresh 'post_trade' snapshot (full book + complete market payload + recent
+public trade tape), taken AFTER submit so it never delays the order.
 """
 from __future__ import annotations
 
@@ -324,12 +330,12 @@ class Engine:
 
         if not cfg.live_enabled:
             return 0
-        placed = self._submit(decision_id, lane, cand, o)
+        placed = self._submit(cycle_id, decision_id, lane, cand, o)
         if placed:
             book.apply_order(cand.ticker, o.side, o.contracts, o.limit_price, o.fee_usd)
         return placed
 
-    def _submit(self, decision_id: int, lane: str, cand: Candidate, o: strategies.Order) -> int:
+    def _submit(self, cycle_id: int, decision_id: int, lane: str, cand: Candidate, o: strategies.Order) -> int:
         cfg = self.cfg
         price_cents = max(1, min(99, int(round(o.limit_price * 100))))
         client_order_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"betx/{cfg.instance_name}/{lane}/{decision_id}"))
@@ -349,13 +355,14 @@ class Engine:
             close_time=cand.close_time,
         )
         if cfg.dry_run:
-            self.store.insert_order(
+            order_row_id = self.store.insert_order(
                 status="dry_run", dry_run=True,
                 filled_count=o.contracts, avg_fill_price_cents=float(price_cents),
                 fees_usd=o.fee_usd,
                 raw={"simulated": True}, **base_row,
             )
             log.info("[dry-run] %s %s %dx %s @ %d¢", lane, o.side, o.contracts, cand.ticker, price_cents)
+            self._snapshot_trade(cycle_id, order_row_id, cand.ticker)
             return 1
         try:
             expiration = int(dt.datetime.now(dt.timezone.utc).timestamp()) + cfg.order_expiration_sec
@@ -368,17 +375,19 @@ class Engine:
             status = {"executed": "executed", "resting": "resting", "pending": "pending", "canceled": "canceled"}.get(
                 od.get("status", ""), od.get("status") or "submitted"
             )
-            self.store.insert_order(
+            order_row_id = self.store.insert_order(
                 status=status,
                 kalshi_order_id=od.get("order_id"),
                 filled_count=kalshi_mod.count_of(od, "fill_count") or (o.contracts if status == "executed" else 0),
                 raw=od, **base_row,
             )
             log.info("placed %s %s %dx %s @ %d¢ -> %s", lane, o.side, o.contracts, cand.ticker, price_cents, status)
+            self._snapshot_trade(cycle_id, order_row_id, cand.ticker)
             return 1
         except KalshiError as e:
-            self.store.insert_order(status="failed", raw={"error": str(e)[:500]}, **base_row)
+            order_row_id = self.store.insert_order(status="failed", raw={"error": str(e)[:500]}, **base_row)
             log.error("order failed %s %s: %s", lane, cand.ticker, e)
+            self._snapshot_trade(cycle_id, order_row_id, cand.ticker)
             return 0
 
     # ---------------------------------------------------------------- helpers
@@ -412,6 +421,7 @@ class Engine:
                 instance=self.cfg.instance_name,
                 cycle_id=cycle_id,
                 ticker=ticker,
+                kind="decision",
                 status=market.get("status"),
                 close_time=close_time,
                 yes_bid=q["yes_bid"], yes_ask=q["yes_ask"],
@@ -430,6 +440,46 @@ class Engine:
             snap_id = None
         self._book_snap_ids[ticker] = snap_id
         return snap_id
+
+    def _snapshot_trade(self, cycle_id: int, order_row_id: int | None, ticker: str) -> None:
+        """Full market-state capture at trade time: fresh full-depth book,
+        the complete market payload, and the recent public trade tape —
+        fetched AFTER submit (never delays the order) and deliberately NOT
+        through the per-cycle caches, so it reflects the venue at this
+        moment, including our own fill's impact. Best-effort: a capture
+        failure never fails the trade path."""
+        try:
+            market = self.kalshi.market(ticker)
+            ob = self.kalshi.orderbook(ticker)
+            try:
+                tape = self.kalshi.recent_trades(ticker, limit=100)
+            except Exception:
+                log.exception("trade tape fetch failed for %s", ticker)
+                tape = None
+            yes_asks, no_asks = strategies.ladders_from_orderbook(ob)
+            q = kalshi_mod.market_quotes(market)
+            self.store.insert_book_snapshot(
+                instance=self.cfg.instance_name,
+                cycle_id=cycle_id,
+                ticker=ticker,
+                kind="post_trade",
+                order_id=order_row_id,
+                status=market.get("status"),
+                close_time=_effective_close(market),
+                yes_bid=q["yes_bid"], yes_ask=q["yes_ask"],
+                no_bid=q["no_bid"], no_ask=q["no_ask"],
+                last_price=q["last_price"],
+                volume_24h=kalshi_mod.count_of(market, "volume_24h") or None,
+                open_interest=kalshi_mod.count_of(market, "open_interest") or None,
+                liquidity=q["liquidity"],
+                orderbook=ob,
+                yes_asks=[[p, c] for p, c in yes_asks],
+                no_asks=[[p, c] for p, c in no_asks],
+                trades=tape,
+                raw_market=market,
+            )
+        except Exception:
+            log.exception("post-trade snapshot failed for %s", ticker)
 
     def _get_market(self, ticker: str) -> dict | None:
         if ticker in self._market_cache:
@@ -466,7 +516,7 @@ class Engine:
                 "last_price": q["last_price"],
                 "volume_24h": kalshi_mod.count_of(market, "volume_24h") or None,
                 "liquidity": q["liquidity"],
-                "raw": {k: v for k, v in market.items() if k in ("open_time", "expected_expiration_time", "result")},
+                "raw": market,
             }
         )
 

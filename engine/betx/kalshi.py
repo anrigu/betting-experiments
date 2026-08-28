@@ -1,4 +1,9 @@
-"""Minimal Kalshi trade-api v2 client (RSA-PSS signed), sync httpx.
+"""Minimal Kalshi trade-api v2 client, sync httpx.
+
+Two hosts: market data (markets, orderbooks, events, public trades) goes to
+Kalshi's unauthenticated external API (`external-api.kalshi.com`) with a
+fallback to the signed host on outage; portfolio and order endpoints are
+always RSA-PSS signed against the trading host.
 
 Verified against the live API with the production account credentials.
 """
@@ -83,14 +88,26 @@ class KalshiError(RuntimeError):
 
 
 class KalshiClient:
-    def __init__(self, base_url: str, api_key_id: str, private_key_pem: bytes, timeout: float = 30.0):
+    def __init__(
+        self,
+        base_url: str,
+        api_key_id: str = "",
+        private_key_pem: bytes = b"",
+        timeout: float = 30.0,
+        public_base_url: str = "",
+    ):
         self.base_url = base_url.rstrip("/")
+        self.public_base_url = public_base_url.rstrip("/")
         self.api_key_id = api_key_id
-        self._key = serialization.load_pem_private_key(private_key_pem, password=None)
+        # Credentials are optional so the client can run public-market-data-only
+        # (scripts, backtests); any signed endpoint then raises.
+        self._key = serialization.load_pem_private_key(private_key_pem, password=None) if private_key_pem else None
         self._http = httpx.Client(timeout=timeout)
 
     # --- auth ---
     def _headers(self, method: str, path: str) -> dict[str, str]:
+        if self._key is None:
+            raise RuntimeError("Kalshi API credentials not configured (signed endpoint requested)")
         ts = str(int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000))
         msg = f"{ts}{method}{path}".encode()
         sig = self._key.sign(
@@ -105,17 +122,26 @@ class KalshiClient:
             "Content-Type": "application/json",
         }
 
-    def _request(self, method: str, path: str, params: dict | None = None, json_body: dict | None = None, retries: int = 3) -> dict:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: dict | None = None,
+        json_body: dict | None = None,
+        retries: int = 3,
+        auth: bool = True,
+    ) -> dict:
         full_path = API_PREFIX + path
+        base = self.base_url if auth else self.public_base_url
         last: Exception | None = None
         for attempt in range(retries):
             try:
                 r = self._http.request(
                     method,
-                    self.base_url + full_path,
+                    base + full_path,
                     params=params,
                     json=json_body,
-                    headers=self._headers(method, full_path),
+                    headers=self._headers(method, full_path) if auth else {"Content-Type": "application/json"},
                 )
             except httpx.HTTPError as e:
                 last = e
@@ -132,6 +158,33 @@ class KalshiClient:
 
     def get(self, path: str, **params) -> dict:
         return self._request("GET", path, params={k: v for k, v in params.items() if v is not None})
+
+    def _public(self, path: str, params: Any) -> dict:
+        """Market-data GET: unauthenticated external API first, signed host as
+        fallback. Falls back on outage-shaped failures (transport, 429, 5xx)
+        AND on 404 — the public host lags market creation by minutes, and a
+        genuinely missing market 404s on the signed host too. Deterministic
+        client errors (400/401/403) propagate directly.
+
+        `params` is a dict, or a list of pairs for endpoints that take a
+        repeated key (the batch orderbook endpoint wants `tickers` once per
+        ticker, not a comma-joined string — comma-joining silently returns
+        one empty book for the joined literal)."""
+        if self.public_base_url:
+            try:
+                return self._request("GET", path, params=params, auth=False)
+            except httpx.HTTPError as e:
+                if self._key is None:
+                    raise
+                log.warning("public API failed for %s (%s); falling back to signed host", path, e)
+            except KalshiError as e:
+                if self._key is None or (e.status < 500 and e.status not in (404, 429)):
+                    raise
+                log.warning("public API failed for %s (%s); falling back to signed host", path, e)
+        return self._request("GET", path, params=params)
+
+    def get_public(self, path: str, **params) -> dict:
+        return self._public(path, {k: v for k, v in params.items() if v is not None})
 
     def post(self, path: str, body: dict) -> dict:
         return self._request("POST", path, json_body=body)
@@ -185,23 +238,74 @@ class KalshiClient:
             if not cursor:
                 return out
 
-    # --- markets ---
+    # --- markets (public market-data API, signed fallback) ---
     def markets(self, status: str = "open", limit: int = 200, cursor: str | None = None, **kw) -> dict:
-        return self.get("/markets", status=status, limit=limit, cursor=cursor, **kw)
+        return self.get_public("/markets", status=status, limit=limit, cursor=cursor, **kw)
 
     def market(self, ticker: str) -> dict:
-        return self.get(f"/markets/{ticker}").get("market", {})
+        return self.get_public(f"/markets/{ticker}").get("market", {})
 
-    def orderbook(self, ticker: str, depth: int = 16) -> dict:
-        """Returns the raw book dict. Current API shape is `orderbook_fp`
+    def orderbook(self, ticker: str, depth: int | None = None) -> dict:
+        """Returns the raw book dict — FULL depth unless `depth` is given.
+        Current API shape is `orderbook_fp`
         ({"yes_dollars": [["0.4000","90.00"], ...], "no_dollars": [...]} —
         BID levels in dollar strings); older shape was `orderbook`
         ({"yes": [[40, 90], ...]} in cents)."""
-        resp = self.get(f"/markets/{ticker}/orderbook", depth=depth)
+        resp = self.get_public(f"/markets/{ticker}/orderbook", depth=depth)
         return resp.get("orderbook_fp") or resp.get("orderbook") or {}
 
+    # Batch market-data reads. The venue caps `tickers` at 100 per request
+    # (200 is a 400), so callers chunk.
+    BATCH_MAX = 100
+
+    def orderbooks(self, tickers: list[str]) -> dict[str, dict]:
+        """Full-depth books for many tickers, keyed by ticker. Chunked at
+        BATCH_MAX; a failed chunk is logged and skipped, never fatal."""
+        out: dict[str, dict] = {}
+        uniq = list(dict.fromkeys(t for t in tickers if t))
+        for i in range(0, len(uniq), self.BATCH_MAX):
+            chunk = uniq[i:i + self.BATCH_MAX]
+            try:
+                resp = self._public("/markets/orderbooks", [("tickers", t) for t in chunk])
+            except KalshiError as e:
+                log.warning("batch orderbooks failed for %d tickers (%s)", len(chunk), e)
+                continue
+            for ob in resp.get("orderbooks") or []:
+                t = ob.get("ticker")
+                if t:
+                    out[t] = ob.get("orderbook_fp") or ob.get("orderbook") or {}
+        return out
+
+    def markets_by_tickers(self, tickers: list[str]) -> dict[str, dict]:
+        """Market payloads for many tickers, keyed by ticker."""
+        out: dict[str, dict] = {}
+        uniq = list(dict.fromkeys(t for t in tickers if t))
+        for i in range(0, len(uniq), self.BATCH_MAX):
+            chunk = uniq[i:i + self.BATCH_MAX]
+            try:
+                resp = self._public("/markets", {"tickers": ",".join(chunk), "limit": self.BATCH_MAX})
+            except KalshiError as e:
+                log.warning("batch markets failed for %d tickers (%s)", len(chunk), e)
+                continue
+            for m in resp.get("markets") or []:
+                if m.get("ticker"):
+                    out[m["ticker"]] = m
+        return out
+
+    def market_trades(self, ticker: str, limit: int = 100, cursor: str | None = None,
+                      min_ts: int | None = None, max_ts: int | None = None) -> dict:
+        """Public trade tape for one market (most recent first)."""
+        return self.get_public("/markets/trades", ticker=ticker, limit=limit,
+                               cursor=cursor, min_ts=min_ts, max_ts=max_ts)
+
+    def recent_trades(self, ticker: str, limit: int = 100) -> list[dict]:
+        return self.market_trades(ticker, limit=limit).get("trades", [])
+
     def events(self, status: str = "open", limit: int = 200, cursor: str | None = None, **kw) -> dict:
-        return self.get("/events", status=status, limit=limit, cursor=cursor, **kw)
+        return self.get_public("/events", status=status, limit=limit, cursor=cursor, **kw)
+
+    def event(self, event_ticker: str, with_nested_markets: bool = False) -> dict:
+        return self.get_public(f"/events/{event_ticker}", with_nested_markets=with_nested_markets or None)
 
     # --- trading ---
     def create_order(

@@ -11,6 +11,36 @@ services:
     envVars:
       - fromGroup: betx-shared
 
+  # Read-only market-data collector, both venues. Separate service on
+  # purpose: no trading credentials, no wallet, writes only pm_*/kx_*, and
+  # runs on its own cadence independent of the decision loop.
+  - type: worker
+    name: betx-collector
+    runtime: python
+    region: oregon
+    plan: starter
+    branch: main
+    buildCommand: pip install -r engine/requirements.txt
+    startCommand: python engine/collect.py
+    autoDeploy: true
+    envVars:
+      - fromGroup: betx-shared
+
+  # Event-driven capture on both venues' WebSocket feeds. Runs alongside
+  # betx-collector, not instead of it: polling owns metadata, price history
+  # and the periodic baseline; this fills in what happens between polls.
+  - type: worker
+    name: betx-stream
+    runtime: python
+    region: oregon
+    plan: starter
+    branch: main
+    buildCommand: pip install -r engine/requirements.txt
+    startCommand: python engine/stream.py
+    autoDeploy: true
+    envVars:
+      - fromGroup: betx-shared
+
   - type: web
     name: betx-dashboard
     runtime: python
@@ -43,5 +73,41 @@ envVarGroups:
         value: gemini:agent-gemini-3.1-pro:fundamental:150:brier,fable-5:agent-claude-fable-5:fundamental:150:brier,gemini-log:agent-gemini-3.1-pro:fundamental:150:log
       - key: BETX_ARENA_REFERENCE_PREDICTORS
         value: gemini-3.1-pro,claude-fable-5
+      # --- collection (read-only, both venues, one cadence) ---
+      - key: BETX_COLLECT_INTERVAL_SEC
+        value: "300"
+      - key: BETX_PM_ENABLED
+        value: "true"
+      - key: BETX_KX_ENABLED
+        value: "true"
+      - key: BETX_PM_UNIVERSE
+        value: arena            # arena | all | both
+      # Kalshi scope: arena tracks ~15k open markets, so collect the ones
+      # carrying a recent forecast. NOT filtered by close time - the engine
+      # trades markets resolving months out, and filtering would drop their
+      # books. 0 disables a window.
+      - key: BETX_KX_FORECAST_WITHIN_DAYS
+        value: "30"
+      - key: BETX_KX_CLOSING_WITHIN_DAYS
+        value: "0"
+      # --- streaming (betx-stream) ---
+      # Books are held in memory and written only on change, at most once per
+      # MIN_INTERVAL per market: the raw feeds run ~1,400 deltas/sec at full
+      # scope, so a row per message is not an option. Trades are always written.
+      - key: BETX_STREAM_ENABLED
+        value: "true"
+      - key: BETX_STREAM_MIN_INTERVAL_SEC
+        value: "30"
+      - key: BETX_STREAM_KX_MAX_TICKERS
+        value: "5000"
+      # Price history at hourly resolution (FIDELITY, not EVERY_N, is what
+      # controls stored rows - the series is cumulative). Full order book
+      # depth is the priority and is captured every cycle instead.
+      - key: BETX_PM_HISTORY_EVERY_N
+        value: "12"
+      - key: BETX_PM_HISTORY_FIDELITY
+        value: "60"
+      - key: BETX_PM_HISTORY_COLD_INTERVAL
+        value: max              # full history the first time a token is seen
       # secrets (DATABASE_URL, ARENA_DATABASE_URL, KALSHI_API_KEY_ID,
       # KALSHI_PRIVATE_KEY_B64) are set directly on the group, not committed

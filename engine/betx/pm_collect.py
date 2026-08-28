@@ -353,7 +353,7 @@ class PolymarketCollector:
 
     # ------------------------------------------------------------- trades
     def _collect_trades(self, cycle_id: int, events: list[PMEvent], detail: dict) -> int:
-        marks = self.store.pm_trade_watermarks(self.cfg.instance_name)
+        marks = self.store.pm_trade_watermarks()
         token_meta: dict[str, tuple[str, str]] = {}
         targets: list[tuple[PMEvent, PMMarket]] = []
         for ev in events:

@@ -333,3 +333,54 @@ def test_natural_key_tables_have_no_id_column():
         body = ddl.split(f"{table} (")[1].split(");")[0]
         assert f"{pk} TEXT PRIMARY KEY" in body, table
         assert "id BIGSERIAL" not in body, table
+
+
+# --- trade identity is venue-wide, not per-collector ---------------------
+def test_trade_tables_are_unique_on_the_trade_alone():
+    """A trade is a fact about the venue. Keying it on (instance, id) stored
+    the same fill once per collector run -- 50% of pm_trades when this was
+    found. `instance` stays as provenance but must not partition it."""
+    from betx.db import COLLECT_DDL
+
+    ddl = COLLECT_DDL.format(s="s")
+    for table in ("pm_trades", "kx_trades"):
+        body = ddl.split(f"{table} (")[1].split(");")[0]
+        assert "UNIQUE (instance," not in body, table
+    assert "CREATE UNIQUE INDEX ux_pm_trades_key ON s.pm_trades (trade_key)" in ddl
+    assert "CREATE UNIQUE INDEX ux_kx_trades_id ON s.kx_trades (trade_id)" in ddl
+
+
+def test_dedupe_migration_keeps_the_earliest_row_and_is_guarded():
+    """It must run once, not on every startup, and keep the first observation."""
+    from betx.db import COLLECT_DDL
+
+    ddl = COLLECT_DDL.format(s="s")
+    assert "t.id > keep.id" in ddl                      # keeps MIN(id)
+    assert "relname = 'ux_pm_trades_key'" in ddl        # guard
+    assert "relnamespace = 's'::regnamespace" in ddl    # schema-scoped guard
+    # book snapshots are a time series; multiple rows per market/time are the point
+    assert "DELETE FROM s.pm_book_snapshots" not in ddl
+    assert "DELETE FROM s.kx_book_snapshots" not in ddl
+
+
+def test_trade_watermarks_are_not_instance_scoped():
+    """A per-instance watermark against a venue-wide key refetches trades that
+    already exist under another label and drops them on conflict, every cycle."""
+    import inspect
+
+    from betx.db import Store
+
+    for fn in (Store.pm_trade_watermarks, Store.kx_trade_watermarks):
+        assert "instance" not in inspect.signature(fn).parameters, fn.__name__
+        assert "WHERE instance" not in inspect.getsource(fn), fn.__name__
+
+
+def test_stale_cycle_sweep_only_touches_unfinished_rows_for_this_instance():
+    import inspect
+
+    from betx.db import Store
+
+    src = inspect.getsource(Store.fail_stale_collect_cycles)
+    assert "finished_at IS NULL" in src
+    assert "instance = %s" in src
+    assert "COALESCE(error," in src          # never overwrites a real error

@@ -68,6 +68,9 @@ def main() -> None:
 
     store = Store(cfg.database_url, cfg.db_schema)
     store.migrate()
+    stale = store.fail_stale_collect_cycles(cfg.instance_name)
+    if stale:
+        log.info("closed %d cycle(s) abandoned by a previous restart", stale)
     arena = ArenaDB(cfg.arena_database_url)
     collector = Collector(cfg, store, arena)
 

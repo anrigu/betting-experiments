@@ -407,8 +407,9 @@ CREATE TABLE IF NOT EXISTS {s}.pm_trades (
     proxy_wallet TEXT,
     transaction_hash TEXT,
     source TEXT NOT NULL DEFAULT 'poll',
-    raw JSONB,
-    UNIQUE (instance, trade_key)
+    raw JSONB
+    -- Uniqueness is on trade_key alone, created below: a trade is venue
+    -- truth, so `instance` is provenance and must not partition it.
 );
 
 -- 1-minute mid-price series per token (CLOB /prices-history).
@@ -552,8 +553,8 @@ CREATE TABLE IF NOT EXISTS {s}.kx_trades (
     notional_usd DOUBLE PRECISION,
     traded_at TIMESTAMPTZ,
     source TEXT NOT NULL DEFAULT 'poll',
-    raw JSONB,
-    UNIQUE (instance, trade_id)
+    raw JSONB
+    -- Uniqueness is on trade_id alone, created below (see pm_trades).
 );
 
 -- Arena outcomes on Kalshi events that carry no ticker mapping. The trading
@@ -574,6 +575,42 @@ CREATE INDEX IF NOT EXISTS idx_kx_book_ticker ON {s}.kx_book_snapshots (ticker, 
 CREATE INDEX IF NOT EXISTS idx_kx_book_cycle ON {s}.kx_book_snapshots (cycle_id);
 CREATE INDEX IF NOT EXISTS idx_kx_trades_ticker ON {s}.kx_trades (ticker, traded_at DESC);
 CREATE INDEX IF NOT EXISTS idx_kx_markets_event ON {s}.kx_markets (event_ticker);
+
+-- A trade is a fact about the venue, so storing it once per collector run
+-- was pure duplication: two runs over the same market produced two rows for
+-- the same fill (50% of pm_trades at the time this landed). `instance` stays
+-- as provenance but leaves the unique key, and the tape watermarks go global
+-- to match -- otherwise a collector refetches trades that already exist
+-- under another instance label, every cycle, forever.
+--
+-- Guarded on the index existing so the dedupe runs once, not on every start.
+-- Book snapshots are deliberately untouched: multiple rows per (market, time)
+-- are the entire point of a time series.
+DO $do$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_class
+    WHERE relname = 'ux_pm_trades_key' AND relnamespace = '{s}'::regnamespace
+  ) THEN
+    DELETE FROM {s}.pm_trades t USING {s}.pm_trades keep
+      WHERE t.trade_key = keep.trade_key AND t.id > keep.id;
+    ALTER TABLE {s}.pm_trades DROP CONSTRAINT IF EXISTS pm_trades_instance_trade_key_key;
+    ALTER TABLE {s}.pm_trades DROP CONSTRAINT IF EXISTS pm_trades_trade_key_key;
+    CREATE UNIQUE INDEX ux_pm_trades_key ON {s}.pm_trades (trade_key);
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_class
+    WHERE relname = 'ux_kx_trades_id' AND relnamespace = '{s}'::regnamespace
+  ) THEN
+    DELETE FROM {s}.kx_trades t USING {s}.kx_trades keep
+      WHERE t.trade_id = keep.trade_id AND t.id > keep.id;
+    ALTER TABLE {s}.kx_trades DROP CONSTRAINT IF EXISTS kx_trades_instance_trade_id_key;
+    ALTER TABLE {s}.kx_trades DROP CONSTRAINT IF EXISTS kx_trades_trade_id_key;
+    CREATE UNIQUE INDEX ux_kx_trades_id ON {s}.kx_trades (trade_id);
+  END IF;
+END
+$do$;
 
 CREATE INDEX IF NOT EXISTS idx_pm_book_token ON {s}.pm_book_snapshots (token_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pm_book_cond ON {s}.pm_book_snapshots (condition_id, created_at DESC);
@@ -860,6 +897,23 @@ class Store:
         conflict = f"ON CONFLICT ({key}) DO UPDATE SET {sets}, updated_at = now()"
         return self._insert_many(table, rows, conflict=conflict, chunk=chunk)
 
+    def fail_stale_collect_cycles(self, instance: str) -> int:
+        """Close out cycles orphaned by a restart.
+
+        A row with finished_at NULL is indistinguishable from one genuinely
+        in flight, and every deploy that lands mid-cycle leaves one behind.
+        Called at startup, when by definition nothing of ours is running."""
+        with self.conn() as c:
+            cur = c.execute(
+                f"UPDATE {self.schema}.collect_cycles SET finished_at = now(), "
+                "error = COALESCE(error, 'abandoned: collector restarted') "
+                "WHERE instance = %s AND finished_at IS NULL RETURNING id",
+                (instance,),
+            )
+            n = len(cur.fetchall())
+            c.commit()
+        return n
+
     def start_collect_cycle(self, instance: str, venues: str) -> int:
         return self._insert(  # type: ignore[return-value]
             "collect_cycles", {"instance": instance, "venues": venues}
@@ -887,7 +941,7 @@ class Store:
 
     def insert_pm_trades(self, rows: list[dict[str, Any]]) -> int:
         return self._insert_many(
-            "pm_trades", rows, conflict="ON CONFLICT (instance, trade_key) DO NOTHING"
+            "pm_trades", rows, conflict="ON CONFLICT (trade_key) DO NOTHING"
         )
 
     def insert_pm_price_history(self, rows: list[dict[str, Any]]) -> int:
@@ -913,13 +967,16 @@ class Store:
             ).format(s=self.schema),
         )
 
-    def pm_trade_watermarks(self, instance: str) -> dict[str, int]:
+    def pm_trade_watermarks(self) -> dict[str, int]:
         """{condition_id: latest trade epoch seconds} in one round trip —
-        per-market watermark queries would dominate the cycle."""
+        per-market watermark queries would dominate the cycle.
+
+        Not scoped to an instance: trades are unique venue-wide, so a
+        per-instance watermark would refetch trades that already exist under
+        another label and silently discard them on conflict."""
         rows = self.query(
             "SELECT condition_id, EXTRACT(EPOCH FROM max(traded_at))::bigint AS ts "
-            "FROM {s}.pm_trades WHERE instance = %s GROUP BY condition_id",
-            (instance,),
+            "FROM {s}.pm_trades GROUP BY condition_id"
         )
         return {r["condition_id"]: int(r["ts"]) for r in rows if r["ts"] is not None}
 
@@ -955,14 +1012,14 @@ class Store:
 
     def insert_kx_trades(self, rows: list[dict[str, Any]]) -> int:
         return self._insert_many(
-            "kx_trades", rows, conflict="ON CONFLICT (instance, trade_id) DO NOTHING"
+            "kx_trades", rows, conflict="ON CONFLICT (trade_id) DO NOTHING"
         )
 
-    def kx_trade_watermarks(self, instance: str) -> dict[str, int]:
+    def kx_trade_watermarks(self) -> dict[str, int]:
+        """Global, for the same reason as pm_trade_watermarks."""
         rows = self.query(
             "SELECT ticker, EXTRACT(EPOCH FROM max(traded_at))::bigint AS ts "
-            "FROM {s}.kx_trades WHERE instance = %s GROUP BY ticker",
-            (instance,),
+            "FROM {s}.kx_trades GROUP BY ticker"
         )
         return {r["ticker"]: int(r["ts"]) for r in rows if r["ts"] is not None}
 

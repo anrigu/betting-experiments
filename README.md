@@ -265,6 +265,16 @@ apart already disagree on 6/60.
 - `kx_book_snapshots` — full depth per ticker: raw `yes_bids`/`no_bids` and
   derived executable `yes_asks`/`no_asks`
 - `kx_trades` — public tape, deduped on Kalshi's real `trade_id`
+
+**`instance` is provenance, not a partition.** On the trade tables uniqueness
+is on the trade itself (`trade_key` / `trade_id`), not `(instance, ...)` — a
+trade is a fact about the venue, and keying it per collector run stored the
+same fill twice whenever two runs overlapped a market (it was 50% of
+`pm_trades` before this was fixed). The tape watermarks are global for the
+same reason: a per-instance watermark against a venue-wide key refetches
+trades that already exist under another label and discards them on conflict,
+every cycle, forever. Book snapshots keep no unique key at all — multiple rows
+per (market, time) are the entire point of a time series.
 - `collect_cycles` — one row per cycle covering both venues, with a per-venue
   breakdown in `detail`
 

@@ -253,7 +253,7 @@ class KalshiCollector:
         payload already tells us total volume, so a market whose volume is
         unchanged since last cycle cannot have traded and is skipped.
         """
-        marks = self.store.kx_trade_watermarks(self.cfg.instance_name)
+        marks = self.store.kx_trade_watermarks()
         candidates = []
         for ticker, m in markets.items():
             vol = _fp(m, "volume")

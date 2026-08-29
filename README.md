@@ -293,26 +293,27 @@ trimmed to pay for it.
 Measured on-disk cost (heap + TOAST + indexes, real rows loaded into Postgres),
 against arena's current PM set of 41 events / 227 markets / 394 live tokens:
 
-Per-row costs are measured (real rows loaded into Postgres); row counts follow
-from the **hourly** interval (24 cycles/day):
+Measured in production over a clean 7-hour steady-state window at the
+**hourly** interval, extrapolated to a day:
 
-| table | bytes/row | MB/day |
+| table | rows/day | MB/day |
 |---|---:|---:|
-| `kx_book_snapshots` | 1,553 | ~135 |
-| `pm_book_snapshots` | 1,732 | ~16 |
-| `kx_trades` / `pm_trades` | 697 / 2,167 | ~50 |
-| `pm_market_snapshots` | 544 | ~3 |
-| `pm_price_history` | 671 | ~6 |
-| **total** | | **~210** (~6 GB/month) |
+| `kx_book_snapshots` | 124,659 | 184.6 |
+| `kx_trades` | 137,959 | 91.7 |
+| `pm_book_snapshots` | 13,413 | 22.2 |
+| `pm_trades` | 10,502 | 21.7 |
+| `pm_price_history` | 26,784 | 17.1 |
+| `pm_market_snapshots` | 7,464 | 3.9 |
+| **total** | | **341 MB/day (~10 GB/month)** |
 
-Book row counts at hourly are an estimate: more of each book changes over an
-hour than over five minutes, so the unchanged-book skip rate falls and the
-saving is less than the 12x the interval change suggests. The real figure
-shows up in `collect_cycles.detail` within a day — check
-`books_unchanged_skipped` against `books_returned`.
+Kalshi is 81% of it — books 54%, tape 27% — which is what the wide
+forecast-scoped universe buys. At full retention that is roughly $7/month
+rising to ~$21/month by month twelve on Supabase Pro.
 
-One-time costs, already paid and not recurring: the first cycle backfills each
-market's trade history and every token's price series — 742 MB across
+Two things that look like leaks and are not. `pm_price_history` spikes
+whenever arena adds tokens (146 new ones produced a 72,030-point cycle):
+each new token pulls its full series once, then settles to ~1,120/cycle.
+And a cold start backfills every market's trade history — 742 MB across
 `pm_trades`, `kx_trades` and `pm_price_history`.
 
 `kx_markets`, `pm_markets` and `pm_events` are upserted at a fixed row count
